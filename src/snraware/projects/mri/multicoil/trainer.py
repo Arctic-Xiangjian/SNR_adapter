@@ -70,26 +70,26 @@ def fastmri_current_magnitude_mean(noisy: torch.Tensor) -> torch.Tensor:
     return torch.where(scale == 0, torch.ones_like(scale), scale)
 
 
-def _metric_nmse(prediction: np.ndarray, target: np.ndarray) -> float:
+def _metric_nmse(target: np.ndarray, prediction: np.ndarray) -> float:
     numerator = float(np.sum((prediction - target) ** 2))
     denominator = float(np.sum(target**2))
     return numerator / max(denominator, 1.0e-12)
 
 
-def _metric_psnr(prediction: np.ndarray, target: np.ndarray) -> float:
+def _metric_psnr(target: np.ndarray, prediction: np.ndarray) -> float:
     mse = float(np.mean((prediction - target) ** 2))
     peak = float(np.max(target))
     return 20.0 * np.log10(max(peak, 1.0e-6)) - 10.0 * np.log10(max(mse, 1.0e-12))
 
 
-def _metric_ssim(prediction: np.ndarray, target: np.ndarray) -> float:
+def _metric_ssim(target: np.ndarray, prediction: np.ndarray) -> float:
     try:
         from skimage.metrics import structural_similarity
     except Exception:
         structural_similarity = None
 
     if prediction.ndim == 3:
-        values = [_metric_ssim(prediction[index], target[index]) for index in range(prediction.shape[0])]
+        values = [_metric_ssim(target[index], prediction[index]) for index in range(prediction.shape[0])]
         return float(np.mean(values)) if values else float("nan")
     data_range = float(np.max(target) - np.min(target))
     if data_range <= 0:
@@ -108,6 +108,14 @@ def _metric_ssim(prediction: np.ndarray, target: np.ndarray) -> float:
     return ((2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)) / (
         (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
     )
+
+
+def _volume_metric_fns():
+    try:
+        from fastmri.evaluate import nmse, psnr, ssim
+    except Exception:
+        return {"psnr": _metric_psnr, "ssim": _metric_ssim, "nmse": _metric_nmse}
+    return {"psnr": psnr, "ssim": ssim, "nmse": nmse}
 
 
 def _group_slices_into_volumes(
@@ -132,20 +140,13 @@ def _group_slices_into_volumes(
 def _compute_volume_metrics(grouped: dict[str, tuple[np.ndarray, np.ndarray]]) -> dict[str, float]:
     if not grouped:
         return {"psnr": float("nan"), "ssim": float("nan"), "nmse": float("nan")}
-    psnrs: list[float] = []
-    ssims: list[float] = []
-    nmses: list[float] = []
+    metric_fns = _volume_metric_fns()
+    metric_lists: dict[str, list[float]] = {"psnr": [], "ssim": [], "nmse": []}
     for prediction, target in grouped.values():
-        psnrs.append(_metric_psnr(prediction, target))
-        ssim_value = _metric_ssim(prediction, target)
-        if np.isfinite(ssim_value):
-            ssims.append(float(ssim_value))
-        nmses.append(_metric_nmse(prediction, target))
-    return {
-        "psnr": float(np.mean(psnrs)) if psnrs else float("nan"),
-        "ssim": float(np.mean(ssims)) if ssims else float("nan"),
-        "nmse": float(np.mean(nmses)) if nmses else float("nan"),
-    }
+        metric_lists["psnr"].append(float(metric_fns["psnr"](target, prediction)))
+        metric_lists["ssim"].append(float(metric_fns["ssim"](target, prediction)))
+        metric_lists["nmse"].append(float(metric_fns["nmse"](target, prediction)))
+    return {name: float(np.mean(values)) for name, values in metric_lists.items()}
 
 
 def _set_module_trainable(module: nn.Module, flag: bool) -> None:

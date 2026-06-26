@@ -95,6 +95,8 @@ class PreprocessConfig:
     scale_percentile: float = 50.0
     deterministic_mask_from_name: bool = True
     sample_seed: int = 42
+    mc_gmap: int = 0
+    gmap_mode: str = "ones"
     gmap_value: float = 1.0
     cache_dir: str | None = None
     cache_version: str = "multicoil_ones_gmap_v1"
@@ -108,6 +110,14 @@ class PreprocessConfig:
             raise ValueError("preprocess.grappa_kernel must be [ky, kx]")
         if self.acc_factor <= 0:
             raise ValueError("preprocess.acc_factor must be positive")
+        if float(self.calib_center_fraction) > float(self.center_fraction):
+            raise ValueError("preprocess.calib_center_fraction must be <= preprocess.center_fraction")
+        if int(self.mc_gmap) != 0:
+            raise ValueError("This clean project keeps only preprocess.mc_gmap=0")
+        mode = str(self.gmap_mode).lower().replace("-", "_")
+        if mode != "ones":
+            raise ValueError("This clean project keeps only preprocess.gmap_mode='ones'")
+        self.gmap_mode = mode
         if self.gmap_value <= 0:
             raise ValueError("preprocess.gmap_value must be positive")
         pattern = self.sampling_pattern.lower().replace("-", "_")
@@ -171,6 +181,10 @@ class TrainConfig:
     persistent_workers: bool = True
     shuffle_train: bool = True
     train_patch_size: list[int] = field(default_factory=lambda: [64, 64])
+    eval_patch_batch_size: int = 64
+    overlap_for_inference: list[int] = field(default_factory=lambda: [16, 16, 0])
+    gradient_checkpoint_frozen_base: bool = True
+    frozen_base_eval: bool = True
     correction_lr: float = 5.0e-4
     adapter_lr: float = 1.0e-4
     weight_decay: float = 0.0
@@ -188,10 +202,24 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         self.train_patch_size = [int(v) for v in self.train_patch_size]
+        self.overlap_for_inference = [int(v) for v in self.overlap_for_inference]
         if self.mode != "warmup_then_both":
             raise ValueError("This clean project keeps only mode='warmup_then_both'")
         if self.gmap_warmup_epochs > self.warmup_epochs:
             raise ValueError("train.gmap_warmup_epochs must be <= train.warmup_epochs")
+        if len(self.train_patch_size) != 2:
+            raise ValueError("train.train_patch_size must be [height, width]")
+        if len(self.overlap_for_inference) < 2:
+            raise ValueError("train.overlap_for_inference must provide at least [height, width]")
+        if self.eval_patch_batch_size <= 0:
+            raise ValueError("train.eval_patch_batch_size must be positive")
+        if self.overlap_for_inference[0] < 0 or self.overlap_for_inference[1] < 0:
+            raise ValueError("train.overlap_for_inference must be non-negative")
+        if (
+            self.overlap_for_inference[0] >= self.train_patch_size[0]
+            or self.overlap_for_inference[1] >= self.train_patch_size[1]
+        ):
+            raise ValueError("train.overlap_for_inference must be smaller than train.train_patch_size")
 
 
 @dataclass

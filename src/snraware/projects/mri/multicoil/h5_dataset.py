@@ -88,10 +88,20 @@ def _tensorize_result(result: MulticoilPreprocessResult) -> dict[str, Any]:
         [result.clean_complex.real, result.clean_complex.imag],
         axis=0,
     ).astype(np.float32)
+    metadata = dict(result.metadata)
+    volume_name = str(metadata.get("volume_name", "unknown_volume"))
+    slice_idx = int(metadata.get("slice_idx", -1))
+    metadata.setdefault("name", f"{volume_name}_slice_{slice_idx}")
+    metadata.setdefault("volume_name", volume_name)
+    metadata.setdefault("slice_idx", slice_idx)
+    metadata.setdefault("mean", 0.0)
+    metadata.setdefault("std", float(metadata.get("scale", 1.0)))
+    if result.target_rss is not None:
+        metadata["target_rss"] = torch.from_numpy(np.asarray(result.target_rss, dtype=np.float32)).contiguous()
     return {
         "noisy": torch.from_numpy(noisy).contiguous(),
         "clean": torch.from_numpy(clean).contiguous(),
-        "metadata": dict(result.metadata),
+        "metadata": metadata,
     }
 
 

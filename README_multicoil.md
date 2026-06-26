@@ -16,6 +16,23 @@ whitened/compressed coil basis. The gmap channel is always ones in preprocessing
 `PhysicsCorrectionAdapter` learns bounded complex-scale and effective-gmap
 corrections during fine-tuning.
 
+## SOTA-Parity Invariants
+
+The current fastMRI 5% random-volume run is intentionally aligned to the
+working SOTA run in `/working2/arctic/snrawre/SNRAware`:
+
+- SNRAware base model is built at `train.train_patch_size: [64, 64]`.
+- Full validation images use sliding-window inference over the `384x384`
+  preprocess crop with `train.overlap_for_inference: [16, 16, 0]`.
+- Base checkpoint loading must report `matched_keys=1128`,
+  `mismatched_keys=0`, and `total_model_keys=1128`.
+- The public path keeps `preprocess.mc_gmap: 0` and
+  `preprocess.gmap_mode: ones`; learned correction happens after the all-ones
+  channel is assembled.
+
+Do not change `train.train_patch_size` to the full crop size unless the base
+checkpoint inheritance strategy is intentionally being changed.
+
 ## Main Commands
 
 Dry run config resolution only:

@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from snraware.components.model import Conv2DExt, Conv3DExt, LinearGrid3DExt, LinearGridExt
+
 from .config import CorrectionConfig, LoraConfig
 
 
@@ -94,20 +96,22 @@ class LoRALinear(nn.Module):
 
     def __init__(self, base: nn.Linear, config: LoraConfig):
         super().__init__()
-        self.base = base
-        for parameter in self.base.parameters():
+        self.base_layer = base
+        for parameter in self.base_layer.parameters():
             parameter.requires_grad = False
         rank = int(config.r)
         if rank <= 0:
             raise ValueError("LoRA rank must be positive")
-        self.lora_A = nn.Parameter(torch.empty(rank, base.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank))
+        self.lora_A = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, base.out_features, bias=False)
         self.scaling = float(config.alpha) / float(rank)
         self.dropout = nn.Dropout(float(config.dropout)) if config.dropout > 0 else nn.Identity()
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.to(device=base.weight.device, dtype=base.weight.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + F.linear(F.linear(self.dropout(x), self.lora_A), self.lora_B) * self.scaling
+        return self.base_layer(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
 
 
 class LoRAConv2d(nn.Module):
@@ -117,28 +121,79 @@ class LoRAConv2d(nn.Module):
         super().__init__()
         if base.groups != 1:
             raise ValueError("LoRAConv2d only supports groups=1")
-        self.base = base
-        for parameter in self.base.parameters():
+        self.base_layer = base
+        for parameter in self.base_layer.parameters():
             parameter.requires_grad = False
         rank = int(config.r)
-        self.lora_down = nn.Conv2d(base.in_channels, rank, kernel_size=1, bias=False)
-        self.lora_up = nn.Conv2d(
+        self.lora_A = nn.Conv2d(
+            base.in_channels,
             rank,
-            base.out_channels,
             kernel_size=base.kernel_size,
             stride=base.stride,
             padding=base.padding,
             dilation=base.dilation,
+            groups=base.groups,
+            bias=False,
             padding_mode=base.padding_mode,
+        )
+        self.lora_B = nn.Conv2d(
+            rank,
+            base.out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
             bias=False,
         )
         self.scaling = float(config.alpha) / float(rank)
-        self.dropout = nn.Dropout2d(float(config.dropout)) if config.dropout > 0 else nn.Identity()
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)
+        self.dropout = nn.Dropout(float(config.dropout)) if config.dropout > 0 else nn.Identity()
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.to(device=base.weight.device, dtype=base.weight.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.lora_up(self.lora_down(self.dropout(x))) * self.scaling
+        return self.base_layer(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+
+
+class LoRAConv3d(nn.Module):
+    """Low-rank update around a frozen Conv3d module."""
+
+    def __init__(self, base: nn.Conv3d, config: LoraConfig):
+        super().__init__()
+        if base.groups != 1:
+            raise ValueError("LoRAConv3d only supports groups=1")
+        self.base_layer = base
+        for parameter in self.base_layer.parameters():
+            parameter.requires_grad = False
+        rank = int(config.r)
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive")
+        self.lora_A = nn.Conv3d(
+            base.in_channels,
+            rank,
+            kernel_size=base.kernel_size,
+            stride=base.stride,
+            padding=base.padding,
+            dilation=base.dilation,
+            groups=base.groups,
+            bias=False,
+            padding_mode=base.padding_mode,
+        )
+        self.lora_B = nn.Conv3d(
+            rank,
+            base.out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=False,
+        )
+        self.scaling = float(config.alpha) / float(rank)
+        self.dropout = nn.Dropout(float(config.dropout)) if config.dropout > 0 else nn.Identity()
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        self.to(device=base.weight.device, dtype=base.weight.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base_layer(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
 
 
 @dataclass
@@ -163,7 +218,23 @@ def _get_parent_module(model: nn.Module, dotted_name: str) -> tuple[nn.Module, s
 
 def has_lora_adapters(model: nn.Module) -> bool:
     """Return True when model already contains LoRA wrappers."""
-    return any(isinstance(module, (LoRALinear, LoRAConv2d)) for module in model.modules())
+    return any(isinstance(module, (LoRALinear, LoRAConv2d, LoRAConv3d)) for module in model.modules())
+
+
+def _inject_lora_into_extension(module: nn.Module, config: LoraConfig) -> bool:
+    if isinstance(module, Conv2DExt):
+        if not isinstance(module.conv, LoRAConv2d):
+            module.conv = LoRAConv2d(module.conv, config)
+        return True
+    if isinstance(module, Conv3DExt):
+        if not isinstance(module.conv, LoRAConv3d):
+            module.conv = LoRAConv3d(module.conv, config)
+        return True
+    if isinstance(module, (LinearGridExt, LinearGrid3DExt)):
+        if not isinstance(module.linear, LoRALinear):
+            module.linear = LoRALinear(module.linear, config)
+        return True
+    return False
 
 
 def apply_lora_to_model(model: nn.Module, config: LoraConfig) -> LoraApplyResult:
@@ -171,21 +242,28 @@ def apply_lora_to_model(model: nn.Module, config: LoraConfig) -> LoraApplyResult
     if not config.enabled:
         return LoraApplyResult(num_wrapped=0, wrapped_names=[])
     if has_lora_adapters(model):
-        names = [name for name, module in model.named_modules() if isinstance(module, (LoRALinear, LoRAConv2d))]
+        names = [
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, (LoRALinear, LoRAConv2d, LoRAConv3d))
+        ]
         return LoraApplyResult(num_wrapped=len(names), wrapped_names=names)
 
     replacements: list[tuple[str, str, nn.Module]] = []
+    injected_extensions: list[str] = []
     for name, module in model.named_modules():
         if not name or not _matches_target(name, config.target_modules):
             continue
-        if isinstance(module, nn.Linear):
+        if _inject_lora_into_extension(module, config):
+            injected_extensions.append(name)
+        elif isinstance(module, nn.Linear):
             replacements.append((name, "linear", LoRALinear(module, config)))
         elif isinstance(module, nn.Conv2d):
             replacements.append((name, "conv2d", LoRAConv2d(module, config)))
-        elif hasattr(module, "conv") and isinstance(getattr(module, "conv"), nn.Conv2d):
-            replacements.append((f"{name}.conv", "conv2d", LoRAConv2d(getattr(module, "conv"), config)))
+        elif isinstance(module, nn.Conv3d):
+            replacements.append((name, "conv3d", LoRAConv3d(module, config)))
 
-    wrapped: list[str] = []
+    wrapped: list[str] = list(injected_extensions)
     for dotted_name, _kind, replacement in replacements:
         parent, child_name = _get_parent_module(model, dotted_name)
         setattr(parent, child_name, replacement)

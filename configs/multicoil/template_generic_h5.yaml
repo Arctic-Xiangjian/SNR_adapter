@@ -41,6 +41,8 @@ preprocess:
   scale_percentile: 50.0
   deterministic_mask_from_name: true
   sample_seed: 42
+  mc_gmap: 0
+  gmap_mode: ones
   gmap_value: 1.0
   cache_dir: /working2/arctic/project2/cache/generic_h5_x8_cf004_gmap_ones
   cache_version: multicoil_ones_gmap_v1
@@ -82,6 +84,10 @@ train:
   persistent_workers: true
   shuffle_train: true
   train_patch_size: [64, 64]
+  eval_patch_batch_size: 64
+  overlap_for_inference: [16, 16, 0]
+  gradient_checkpoint_frozen_base: true
+  frozen_base_eval: true
   correction_lr: 0.0005
   adapter_lr: 0.0001
   weight_decay: 0.0

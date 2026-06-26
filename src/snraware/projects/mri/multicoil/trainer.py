@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,95 @@ def simple_nmse(pred: torch.Tensor, target: torch.Tensor) -> float:
     numerator = torch.sum((pred_mag - target_mag) ** 2)
     denominator = torch.sum(target_mag**2).clamp_min(1.0e-12)
     return float((numerator / denominator).item())
+
+
+def fastmri_current_magnitude_mean(noisy: torch.Tensor) -> torch.Tensor:
+    """Per-sample scale used by the old FastMRI fine-tune loss."""
+    if noisy.ndim != 4 or noisy.shape[1] < 2:
+        raise ValueError(f"Expected [B, C>=2, H, W], got {tuple(noisy.shape)}")
+    magnitude = torch.sqrt(noisy[:, 0:1].square() + noisy[:, 1:2].square())
+    scale = magnitude.mean(dim=(-2, -1), keepdim=True)
+    if not torch.isfinite(scale).all():
+        raise ValueError("Current-mean loss normalization received non-finite scale")
+    return torch.where(scale == 0, torch.ones_like(scale), scale)
+
+
+def _metric_nmse(prediction: np.ndarray, target: np.ndarray) -> float:
+    numerator = float(np.sum((prediction - target) ** 2))
+    denominator = float(np.sum(target**2))
+    return numerator / max(denominator, 1.0e-12)
+
+
+def _metric_psnr(prediction: np.ndarray, target: np.ndarray) -> float:
+    mse = float(np.mean((prediction - target) ** 2))
+    peak = float(np.max(target))
+    return 20.0 * np.log10(max(peak, 1.0e-6)) - 10.0 * np.log10(max(mse, 1.0e-12))
+
+
+def _metric_ssim(prediction: np.ndarray, target: np.ndarray) -> float:
+    try:
+        from skimage.metrics import structural_similarity
+    except Exception:
+        structural_similarity = None
+
+    if prediction.ndim == 3:
+        values = [_metric_ssim(prediction[index], target[index]) for index in range(prediction.shape[0])]
+        return float(np.mean(values)) if values else float("nan")
+    data_range = float(np.max(target) - np.min(target))
+    if data_range <= 0:
+        return float("nan")
+    if structural_similarity is not None:
+        return float(structural_similarity(target, prediction, data_range=data_range))
+    pred64 = prediction.astype(np.float64, copy=False)
+    target64 = target.astype(np.float64, copy=False)
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    mu_x = float(pred64.mean())
+    mu_y = float(target64.mean())
+    var_x = float(pred64.var())
+    var_y = float(target64.var())
+    cov_xy = float(((pred64 - mu_x) * (target64 - mu_y)).mean())
+    return ((2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)) / (
+        (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
+    )
+
+
+def _group_slices_into_volumes(
+    volume_names: list[str],
+    slice_indices: list[int],
+    predictions: list[np.ndarray],
+    targets: list[np.ndarray],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    grouped: dict[str, list[tuple[int, np.ndarray, np.ndarray]]] = defaultdict(list)
+    for volume_name, slice_idx, prediction, target in zip(volume_names, slice_indices, predictions, targets):
+        grouped[str(volume_name)].append((int(slice_idx), prediction, target))
+    volumes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for volume_name, entries in grouped.items():
+        entries.sort(key=lambda item: item[0])
+        volumes[volume_name] = (
+            np.stack([entry[1] for entry in entries], axis=0),
+            np.stack([entry[2] for entry in entries], axis=0),
+        )
+    return volumes
+
+
+def _compute_volume_metrics(grouped: dict[str, tuple[np.ndarray, np.ndarray]]) -> dict[str, float]:
+    if not grouped:
+        return {"psnr": float("nan"), "ssim": float("nan"), "nmse": float("nan")}
+    psnrs: list[float] = []
+    ssims: list[float] = []
+    nmses: list[float] = []
+    for prediction, target in grouped.values():
+        psnrs.append(_metric_psnr(prediction, target))
+        ssim_value = _metric_ssim(prediction, target)
+        if np.isfinite(ssim_value):
+            ssims.append(float(ssim_value))
+        nmses.append(_metric_nmse(prediction, target))
+    return {
+        "psnr": float(np.mean(psnrs)) if psnrs else float("nan"),
+        "ssim": float(np.mean(ssims)) if ssims else float("nan"),
+        "nmse": float(np.mean(nmses)) if nmses else float("nan"),
+    }
 
 
 def _set_module_trainable(module: nn.Module, flag: bool) -> None:
@@ -222,13 +312,24 @@ class MulticoilFineTuneTrainer:
         enabled = bool(self.config.runtime.use_bf16 and self.device.type == "cuda")
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=enabled)
 
-    def _loss(self, pred: torch.Tensor, clean: torch.Tensor) -> torch.Tensor:
-        complex_loss = self.loss_fn(pred, clean)
-        magnitude_loss = self.loss_fn(complex_magnitude(pred), complex_magnitude(clean))
+    def _loss(self, pred: torch.Tensor, clean: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
+        scale = fastmri_current_magnitude_mean(noisy).to(device=pred.device, dtype=pred.dtype)
+        complex_loss = self.loss_fn(pred / scale, clean / scale)
+        magnitude_loss = self.loss_fn(complex_magnitude(pred) / scale, complex_magnitude(clean) / scale)
         return (
             float(self.config.train.complex_loss_weight) * complex_loss
             + float(self.config.train.magnitude_loss_weight) * magnitude_loss
         )
+
+    def _checkpoint_base_model_for_epoch(self, epoch: int) -> bool:
+        if not bool(self.config.train.gradient_checkpoint_frozen_base):
+            return False
+        return self._phase_name(epoch) != "joint"
+
+    def _keep_frozen_base_eval_for_epoch(self, epoch: int) -> bool:
+        if not bool(self.config.train.frozen_base_eval):
+            return False
+        return self._phase_name(epoch) != "joint"
 
     def _write_metrics_row(self, row: dict[str, Any]) -> None:
         path = self.run_dir / "metrics.csv"
@@ -238,6 +339,7 @@ class MulticoilFineTuneTrainer:
             "phase",
             "loss",
             "psnr",
+            "ssim",
             "nmse",
             "lr_physics_correction",
             "lr_adapter",
@@ -263,6 +365,8 @@ class MulticoilFineTuneTrainer:
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
         self._apply_phase_trainability(epoch)
+        if self._keep_frozen_base_eval_for_epoch(epoch):
+            self.model.base_model.eval()
         losses: list[float] = []
         limit = self.config.train.limit_train_batches
         for step, batch in enumerate(self.train_loader):
@@ -272,8 +376,8 @@ class MulticoilFineTuneTrainer:
             clean = batch["clean"].to(self.device, non_blocking=True)
             self.optimizer.zero_grad(set_to_none=True)
             with self._autocast():
-                pred = self.model(noisy)
-                loss = self._loss(pred.float(), clean.float())
+                pred = self.model(noisy, checkpoint_base_model=self._checkpoint_base_model_for_epoch(epoch))
+                loss = self._loss(pred.float(), clean.float(), noisy.float())
             if not torch.isfinite(loss):
                 continue
             loss.backward()
@@ -307,29 +411,119 @@ class MulticoilFineTuneTrainer:
         )
         return result
 
+    def _eval_patch_positions(self, size: int, patch: int, overlap: int) -> list[int]:
+        if patch >= size:
+            return [0]
+        step = max(1, patch - overlap)
+        positions = list(range(0, size - patch + 1, step))
+        final = size - patch
+        if positions[-1] != final:
+            positions.append(final)
+        return positions
+
+    def _should_use_eval_patch_inference(self, noisy: torch.Tensor) -> bool:
+        patch_h, patch_w = (int(v) for v in self.config.train.train_patch_size)
+        return noisy.shape[-2] != patch_h or noisy.shape[-1] != patch_w
+
+    def _predict_direct_eval(self, noisy: torch.Tensor) -> torch.Tensor:
+        return self.model(noisy, checkpoint_base_model=False)
+
+    def _predict_sliding_window_eval(self, noisy: torch.Tensor) -> torch.Tensor:
+        batch_size, _channels, height, width = noisy.shape
+        patch_h, patch_w = (int(v) for v in self.config.train.train_patch_size)
+        overlap_h, overlap_w = int(self.config.train.overlap_for_inference[0]), int(
+            self.config.train.overlap_for_inference[1]
+        )
+        if patch_h > height or patch_w > width:
+            raise ValueError(f"Eval patch {(patch_h, patch_w)} must fit inside noisy image {(height, width)}")
+        tops = self._eval_patch_positions(height, patch_h, overlap_h)
+        lefts = self._eval_patch_positions(width, patch_w, overlap_w)
+        prediction_sum = torch.zeros(batch_size, 2, height, width, device=noisy.device, dtype=torch.float32)
+        weight_sum = torch.zeros(batch_size, 1, height, width, device=noisy.device, dtype=torch.float32)
+        pending: list[torch.Tensor] = []
+        coords: list[tuple[int, int]] = []
+        patch_budget = max(1, int(self.config.train.eval_patch_batch_size))
+
+        def flush() -> None:
+            if not pending:
+                return
+            chunk = torch.cat(pending, dim=0)
+            output = self._predict_direct_eval(chunk).float()
+            cursor = 0
+            for top, left in coords:
+                patch_output = output[cursor : cursor + batch_size]
+                cursor += batch_size
+                prediction_sum[..., top : top + patch_h, left : left + patch_w] += patch_output
+                weight_sum[..., top : top + patch_h, left : left + patch_w] += 1.0
+            pending.clear()
+            coords.clear()
+
+        for top in tops:
+            for left in lefts:
+                pending.append(noisy[..., top : top + patch_h, left : left + patch_w])
+                coords.append((top, left))
+                if len(pending) * batch_size >= patch_budget:
+                    flush()
+        flush()
+        return prediction_sum / weight_sum.clamp_min(1.0)
+
+    def _predict_for_eval(self, noisy: torch.Tensor) -> torch.Tensor:
+        if self._should_use_eval_patch_inference(noisy):
+            return self._predict_sliding_window_eval(noisy)
+        return self._predict_direct_eval(noisy)
+
+    def _metadata_to_numpy(
+        self,
+        prediction: torch.Tensor,
+        clean: torch.Tensor,
+        metadata: list[dict[str, Any]],
+    ) -> tuple[list[str], list[int], list[np.ndarray], list[np.ndarray]]:
+        pred_mag = complex_magnitude(prediction).detach().cpu().float().numpy()
+        target_mag = complex_magnitude(clean).detach().cpu().float().numpy()
+        volume_names: list[str] = []
+        slice_indices: list[int] = []
+        predictions: list[np.ndarray] = []
+        targets: list[np.ndarray] = []
+        for index, entry in enumerate(metadata):
+            mean = float(entry.get("mean", 0.0))
+            std = float(entry.get("std", entry.get("scale", 1.0)))
+            volume_names.append(str(entry.get("volume_name", entry.get("name", "unknown_volume"))))
+            slice_indices.append(int(entry.get("slice_idx", index)))
+            predictions.append((pred_mag[index, 0] * std + mean).astype(np.float32, copy=False))
+            targets.append((target_mag[index, 0] * std + mean).astype(np.float32, copy=False))
+        return volume_names, slice_indices, predictions, targets
+
     @torch.no_grad()
     def evaluate(self, loader: DataLoader | None, *, stage: str, epoch: int | None) -> dict[str, float]:
         if loader is None:
             return {}
         self.model.eval()
         losses: list[float] = []
-        psnrs: list[float] = []
-        nmses: list[float] = []
+        volume_names: list[str] = []
+        slice_indices: list[int] = []
+        predictions: list[np.ndarray] = []
+        targets: list[np.ndarray] = []
         limit = self.config.train.limit_val_batches
         for step, batch in enumerate(loader):
             if limit is not None and step >= int(limit):
                 break
-            noisy = batch["noisy"].to(self.device, non_blocking=True)
-            clean = batch["clean"].to(self.device, non_blocking=True)
-            pred = self.model(noisy).float()
-            clean = clean.float()
-            losses.append(float(self._loss(pred, clean).cpu().item()))
-            psnrs.append(simple_psnr(pred, clean))
-            nmses.append(simple_nmse(pred, clean))
+            noisy = batch["noisy"].to(self.device, non_blocking=True).float()
+            clean = batch["clean"].to(self.device, non_blocking=True).float()
+            pred = self._predict_for_eval(noisy).float()
+            losses.append(float(self._loss(pred, clean, noisy).cpu().item()))
+            batch_volume_names, batch_slice_indices, batch_predictions, batch_targets = self._metadata_to_numpy(
+                pred,
+                clean,
+                batch["metadata"],
+            )
+            volume_names.extend(batch_volume_names)
+            slice_indices.extend(batch_slice_indices)
+            predictions.extend(batch_predictions)
+            targets.extend(batch_targets)
+        grouped = _group_slices_into_volumes(volume_names, slice_indices, predictions, targets)
         result = {
             "loss": float(np.mean(losses)) if losses else float("nan"),
-            "psnr": float(np.mean(psnrs)) if psnrs else float("nan"),
-            "nmse": float(np.mean(nmses)) if nmses else float("nan"),
+            **_compute_volume_metrics(grouped),
         }
         self._write_metrics_row(
             {
@@ -400,6 +594,7 @@ def run_training(config: ProjectConfig) -> dict[str, Any]:
         base_config=config.base_model,
         correction_config=config.correction,
         preprocess_config=config.preprocess,
+        train_config=config.train,
     )
     trainer = MulticoilFineTuneTrainer(
         config=config,

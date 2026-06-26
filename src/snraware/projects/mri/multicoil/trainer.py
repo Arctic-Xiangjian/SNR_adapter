@@ -322,9 +322,7 @@ class MulticoilFineTuneTrainer:
         )
 
     def _checkpoint_base_model_for_epoch(self, epoch: int) -> bool:
-        if not bool(self.config.train.gradient_checkpoint_frozen_base):
-            return False
-        return self._phase_name(epoch) != "joint"
+        return bool(self.config.train.gradient_checkpoint_frozen_base and self.model.training)
 
     def _keep_frozen_base_eval_for_epoch(self, epoch: int) -> bool:
         if not bool(self.config.train.frozen_base_eval):

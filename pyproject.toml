@@ -47,6 +47,7 @@ dependencies = [
     "pygrappa",
     "pytest>=8.4.2",
     "dvc[azure]",
+    "fastmri>=0.3.0",
 ]
 
 [project.urls]

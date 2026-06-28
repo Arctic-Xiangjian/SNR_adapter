@@ -49,8 +49,6 @@ preprocess:
 
 base_model:
   variant: large
-  config_path: /working2/arctic/snrawre/SNRAware/checkpoints/large/snraware_large_model.yaml
-  checkpoint_path: /working2/arctic/snrawre/SNRAware/checkpoints/large/snraware_large_model.pts
 
 correction:
   enabled: true

@@ -3,6 +3,16 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
+# Project2 training artifacts and local pretrained weights.
+/cache/
+/checkpoints/
+/runs/
+/outputs/
+/wandb/
+/.venv/
+__pycache__/
+*.py[cod]
+
 # User-specific files
 *.rsuser
 *.suo
@@ -422,5 +432,4 @@ FodyWeavers.xsd
 
 # added by the team
 .idea
-.python-version
 dist

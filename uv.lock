@@ -1013,6 +1013,27 @@ wheels = [
 ]
 
 [[package]]
+name = "fastmri"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h5py" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pytorch-lightning" },
+    { name = "pyyaml" },
+    { name = "runstats" },
+    { name = "scikit-image" },
+    { name = "torch" },
+    { name = "torchmetrics" },
+    { name = "torchvision" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2b/c1/fe4618ba62dd80c1238fc708777bee4d970ba53397ee273a7011111a5e02/fastmri-0.3.0.tar.gz", hash = "sha256:d7a566e5a15f8809baa8924eab8890c232bdf4b04905e53869398bfc610fe1e7", size = 721721, upload-time = "2023-06-26T17:18:10.904Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/73/2141c54dde7c867268063d86bc66d34b375179ffd2220b1953452e99ae37/fastmri-0.3.0-py3-none-any.whl", hash = "sha256:b7a3582868f6fae487d362905db30121caeebef20a98964c1a3445a512d4533c", size = 58140, upload-time = "2023-06-26T17:18:09.271Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1597,16 +1618,15 @@ wheels = [
 
 [[package]]
 name = "lightning-utilities"
-version = "0.15.2"
+version = "0.15.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "packaging" },
-    { name = "setuptools" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b8/39/6fc58ca81492db047149b4b8fd385aa1bfb8c28cd7cacb0c7eb0c44d842f/lightning_utilities-0.15.2.tar.gz", hash = "sha256:cdf12f530214a63dacefd713f180d1ecf5d165338101617b4742e8f22c032e24", size = 31090, upload-time = "2025-08-06T13:57:39.242Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/45/7fa8f56b17dc0f0a41ec70dd307ecd6787254483549843bef4c30ab5adce/lightning_utilities-0.15.3.tar.gz", hash = "sha256:792ae0204c79f6859721ac7f386c237a33b0ed06ba775009cb894e010a842033", size = 33553, upload-time = "2026-02-22T14:48:53.348Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/73/3d757cb3fc16f0f9794dd289bcd0c4a031d9cf54d8137d6b984b2d02edf3/lightning_utilities-0.15.2-py3-none-any.whl", hash = "sha256:ad3ab1703775044bbf880dbf7ddaaac899396c96315f3aa1779cec9d618a9841", size = 29431, upload-time = "2025-08-06T13:57:38.046Z" },
+    { url = "https://files.pythonhosted.org/packages/25/f4/ead6e0e37209b07c9baa3e984ccdb0348ca370b77cea3aaea8ddbb097e00/lightning_utilities-0.15.3-py3-none-any.whl", hash = "sha256:6c55f1bee70084a1cbeaa41ada96e4b3a0fea5909e844dd335bd80f5a73c5f91", size = 31906, upload-time = "2026-02-22T14:48:52.488Z" },
 ]
 
 [[package]]
@@ -3075,6 +3095,20 @@ wheels = [
 ]
 
 [[package]]
+name = "pygrappa"
+version = "0.26.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/70/88da63dc6f77dcd57724480c7187929299ceffef71884bbfc5902a905bbe/pygrappa-0.26.3.tar.gz", hash = "sha256:c16fd9b738c99833e3fad4bf4a4e883d3364262bd3b3f0fdc38fe007ff04cfdf", size = 80451, upload-time = "2024-09-22T23:01:46.819Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/c7/8106bd0d7478c974b845afbf5cfd6eb86a4b38665866c9be45c505bf18c0/pygrappa-0.26.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4727bbc3dabda59607d7cd1278a3bf3781206de78e46399ca108baee9f082177", size = 424373, upload-time = "2024-09-22T23:01:33.512Z" },
+    { url = "https://files.pythonhosted.org/packages/76/dd/2e3f96b29de4ca3993fed8c771c12aa07a06860edf5fea93cc792c856a54/pygrappa-0.26.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:880ed9a6146d5be321e692b7563fb834e25e84dc7459e20a5f5eda5d682adeaf", size = 541379, upload-time = "2024-09-22T23:01:35.205Z" },
+    { url = "https://files.pythonhosted.org/packages/46/92/a505053f95bcc56fbd03a8a061d2dfa653dc0b92744d5620f8374cb19616/pygrappa-0.26.3-cp312-cp312-win_amd64.whl", hash = "sha256:c658f25f4eddc66bf6b016620513c74fa05d6fa7fe821c7a56bd0a72fd2b12d1", size = 431826, upload-time = "2024-09-22T23:01:36.658Z" },
+    { url = "https://files.pythonhosted.org/packages/39/2e/29e592049bd01489dcdc0becae527bfe30310dea93c7781e6c4a42389462/pygrappa-0.26.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:f566ae515c5f308baffb6aa288a4218c392e9accb4017f1304bc4da540dbe84c", size = 420163, upload-time = "2024-09-22T23:01:37.8Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/95/776658d9ac7324f6ac335ed38eb7abd354df9a1c863df67b91d54eca9b3c/pygrappa-0.26.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:490bcfc2de482c298ad6a2d368b0be1d729ff1a0fee75940ebd549f6481e031e", size = 537427, upload-time = "2024-09-22T23:01:39.325Z" },
+    { url = "https://files.pythonhosted.org/packages/78/6f/964ba22837cf723f788a1ae24ff71f468fac60d3cdd687c6dc09f265741b/pygrappa-0.26.3-cp313-cp313-win_amd64.whl", hash = "sha256:eb735f87b937acaee028b371ff58fc8f53e20898ec99fbf32614cef0ca6122ef", size = 430652, upload-time = "2024-09-22T23:01:41.002Z" },
+]
+
+[[package]]
 name = "pygtrie"
 version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3487,6 +3521,12 @@ wheels = [
 ]
 
 [[package]]
+name = "runstats"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/00/f0ce323f237e31a36bf65fa398d4210a579173e2aebda8f9c2ca60d04288/runstats-2.0.0.tar.gz", hash = "sha256:0f9a5e6cc9938bbac3474b17727ffc29fbf5895f33e55ce8843341e0821e77c2", size = 101379, upload-time = "2021-06-11T05:04:20.634Z" }
+
+[[package]]
 name = "scikit-image"
 version = "0.25.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3726,6 +3766,7 @@ dependencies = [
     { name = "click" },
     { name = "dvc", extra = ["azure"] },
     { name = "einops" },
+    { name = "fastmri" },
     { name = "h5py" },
     { name = "hydra-colorlog" },
     { name = "hydra-core" },
@@ -3743,6 +3784,7 @@ dependencies = [
     { name = "pathlib" },
     { name = "piq" },
     { name = "prettytable" },
+    { name = "pygrappa" },
     { name = "pytest" },
     { name = "pytorch-wavelets" },
     { name = "pywavelets" },
@@ -3784,6 +3826,7 @@ requires-dist = [
     { name = "click" },
     { name = "dvc", extras = ["azure"] },
     { name = "einops" },
+    { name = "fastmri", specifier = ">=0.3.0" },
     { name = "h5py" },
     { name = "hydra-colorlog" },
     { name = "hydra-core" },
@@ -3801,6 +3844,7 @@ requires-dist = [
     { name = "pathlib" },
     { name = "piq" },
     { name = "prettytable" },
+    { name = "pygrappa" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytorch-wavelets" },
     { name = "pywavelets" },
@@ -3811,7 +3855,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.8.0" },
     { name = "torch-interpol" },
     { name = "torchinfo" },
-    { name = "torchmetrics", specifier = "==1.7.3" },
+    { name = "torchmetrics", specifier = "==1.9.0" },
     { name = "torchvision" },
     { name = "typing-extensions" },
     { name = "wandb" },
@@ -4008,7 +4052,7 @@ wheels = [
 
 [[package]]
 name = "torchmetrics"
-version = "1.7.3"
+version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lightning-utilities" },
@@ -4016,9 +4060,9 @@ dependencies = [
     { name = "packaging" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/48/22/8b16c4ec34d93ee15024924cbbe84fbd235bb3e1df2cc8f48c865c1528e7/torchmetrics-1.7.3.tar.gz", hash = "sha256:08450a19cdb67ba1608aac0b213e5dc73033e11b60ad4719696ebcede591621e", size = 566545, upload-time = "2025-06-13T15:39:37.498Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/81/34/39b8b749333db56c0585d7a11fa62a283c087bb1dfc897d69fb8cedbefb1/torchmetrics-1.9.0.tar.gz", hash = "sha256:a488609948600df52d3db4fcdab02e62aab2a85ef34da67037dc3e65b8512faa", size = 581765, upload-time = "2026-03-09T17:41:22.443Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/f2/bed7da46003c26ed44fc7fa3ecc98a84216f0d4758e5e6a3693754d490d9/torchmetrics-1.7.3-py3-none-any.whl", hash = "sha256:7b6fd43e92f0a1071c8bcb029637f252b0630699140a93ed8817ce7afe9db34e", size = 962639, upload-time = "2025-06-13T15:39:35.69Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/a2/c7f6ebf546f8f644edf0f999aa98ece106986a77a7b922316bf6414ff825/torchmetrics-1.9.0-py3-none-any.whl", hash = "sha256:bfdcbff3dd1d96b3374bb2496eb39f23c4b28b8a845b6a18c313688e0d2d9ca1", size = 983384, upload-time = "2026-03-09T17:41:19.756Z" },
 ]
 
 [[package]]

@@ -8,6 +8,12 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
+PROJECT_ROOT = Path(__file__).resolve().parents[5]
+BASE_MODEL_FILES = {
+    "large": ("large", "snraware_large_model"),
+    "small": ("small", "snraware_small_model"),
+}
+
 
 def _as_path_list(value: str | Path | list[str] | list[Path] | None) -> list[str]:
     if value is None:
@@ -19,6 +25,10 @@ def _as_path_list(value: str | Path | list[str] | list[Path] | None) -> list[str
 
 def _dataclass_from_dict(cls: type[Any], payload: dict[str, Any] | None) -> Any:
     payload = {} if payload is None else dict(payload)
+    known_names = {item.name for item in fields(cls)}
+    unknown_names = sorted(set(payload) - known_names)
+    if unknown_names:
+        raise ValueError(f"Unknown config field(s) for {cls.__name__}: {unknown_names}")
     kwargs: dict[str, Any] = {}
     for item in fields(cls):
         if item.name in payload:
@@ -33,6 +43,13 @@ def _dataclass_from_dict(cls: type[Any], payload: dict[str, Any] | None) -> Any:
             value = _dataclass_from_dict(item.type, value)
         kwargs[item.name] = value
     return cls(**kwargs)
+
+
+def _resolve_project_path(path: str | Path) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    return candidate.resolve()
 
 
 @dataclass
@@ -78,7 +95,7 @@ class SubsetConfig:
 
 @dataclass
 class PreprocessConfig:
-    """Physics preprocessing used by both training and zero-shot inference."""
+    """Physics preprocessing used by public-dataset fine-tuning."""
 
     crop_size: list[int] = field(default_factory=lambda: [384, 384])
     acc_factor: int = 8
@@ -131,8 +148,25 @@ class BaseModelConfig:
     """Frozen SNRAware base model source."""
 
     variant: str = "large"
-    config_path: str = "/working2/arctic/snrawre/SNRAware/checkpoints/large/snraware_large_model.yaml"
-    checkpoint_path: str = "/working2/arctic/snrawre/SNRAware/checkpoints/large/snraware_large_model.pts"
+    config_path: str | None = None
+    checkpoint_path: str | None = None
+
+    def __post_init__(self) -> None:
+        self.variant = str(self.variant).lower().strip()
+        if self.variant not in BASE_MODEL_FILES:
+            raise ValueError(f"Unsupported base_model.variant: {self.variant}")
+        variant_dir, stem = BASE_MODEL_FILES[self.variant]
+        default_dir = PROJECT_ROOT / "checkpoints" / variant_dir
+        config_path = self.config_path or default_dir / f"{stem}.yaml"
+        checkpoint_path = self.checkpoint_path or default_dir / f"{stem}.pts"
+        resolved_config = _resolve_project_path(config_path)
+        resolved_checkpoint = _resolve_project_path(checkpoint_path)
+        if not resolved_config.exists():
+            raise FileNotFoundError(f"Base model config does not exist: {resolved_config}")
+        if not resolved_checkpoint.exists():
+            raise FileNotFoundError(f"Base model checkpoint does not exist: {resolved_checkpoint}")
+        self.config_path = str(resolved_config)
+        self.checkpoint_path = str(resolved_checkpoint)
 
 
 @dataclass
@@ -145,6 +179,10 @@ class CorrectionConfig:
     complex_log_scale_bound: float = 0.75
     gmap_min: float = 0.01
     gmap_max: float = 12.0
+
+    def __post_init__(self) -> None:
+        if not bool(self.enabled):
+            raise ValueError("This training-only project requires correction.enabled=true")
 
 
 @dataclass
@@ -165,6 +203,18 @@ class LoraConfig:
             r"\.mlp\.2$",
         ]
     )
+
+    def __post_init__(self) -> None:
+        if not bool(self.enabled):
+            raise ValueError("This training-only project requires lora.enabled=true")
+        if int(self.r) <= 0:
+            raise ValueError("lora.r must be positive")
+        if float(self.alpha) <= 0:
+            raise ValueError("lora.alpha must be positive")
+        if float(self.dropout) < 0:
+            raise ValueError("lora.dropout must be non-negative")
+        if not self.target_modules:
+            raise ValueError("lora.target_modules must not be empty")
 
 
 @dataclass
@@ -251,6 +301,10 @@ class ProjectConfig:
 
 def from_container(container: dict[str, Any]) -> ProjectConfig:
     """Build a typed config from a YAML/OmegaConf container."""
+    known_names = {item.name for item in fields(ProjectConfig)}
+    unknown_names = sorted(set(container) - known_names)
+    if unknown_names:
+        raise ValueError(f"Unknown top-level config field(s): {unknown_names}")
     return ProjectConfig(
         train_data=_dataclass_from_dict(H5DataConfig, container.get("train_data")),
         val_data=_dataclass_from_dict(H5DataConfig, container.get("val_data")),

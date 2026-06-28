@@ -17,12 +17,36 @@ from torch.utils.data import DataLoader
 from .adapter import (
     apply_lora_to_model,
     count_trainable_parameters,
+    has_lora_adapters,
     lora_parameters,
     set_lora_trainable,
 )
 from .config import ProjectConfig, save_resolved_config, to_container
 from .h5_dataset import MulticoilH5Dataset, collate_multicoil_batch
 from .snraware_wrapper import SNRAwareMulticoilWrapper, build_multicoil_model
+
+
+MULTICOIL_CHECKPOINT_TYPE = "snraware_project2_multicoil_v1"
+
+
+def _extract_adapter_state(
+    model: SNRAwareMulticoilWrapper,
+    *,
+    include_pre_post: bool,
+) -> dict[str, torch.Tensor]:
+    if not has_lora_adapters(model.base_model):
+        return {}
+    selected: dict[str, torch.Tensor] = {}
+    for name, tensor in model.base_model.state_dict().items():
+        if ".lora_A." in name or ".lora_B." in name or (
+            include_pre_post and (name.startswith("pre.") or name.startswith("post."))
+        ):
+            selected[name] = tensor.detach().cpu()
+    return selected
+
+
+def _is_multicoil_checkpoint(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("checkpoint_type") == MULTICOIL_CHECKPOINT_TYPE
 
 
 def seed_everything(seed: int) -> None:
@@ -236,11 +260,14 @@ class MulticoilFineTuneTrainer:
         self.loss_fn = nn.L1Loss()
         self.current_epoch = 0
         self.best_val_psnr = float("-inf")
+        self.best_epoch: int | None = None
 
         if config.lora.enabled:
             self.lora_result = apply_lora_to_model(self.model.base_model, config.lora)
         else:
             self.lora_result = None
+        if self.lora_result is None or self.lora_result.num_wrapped <= 0:
+            raise RuntimeError("LoRA must be enabled and wrap at least one base-model module")
         self._configure_initial_trainability()
         self.optimizer = self._build_optimizer()
         if config.train.resume_from:
@@ -534,32 +561,106 @@ class MulticoilFineTuneTrainer:
         )
         return result
 
-    def _save_checkpoint(self, path: Path, *, epoch: int, metrics: dict[str, float]) -> None:
-        torch.save(
-            {
-                "checkpoint_type": "snraware_project2_multicoil_v1",
-                "epoch": int(epoch),
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "config": to_container(self.config),
-                "metrics": metrics,
-            },
-            path,
+    def _save_checkpoint(self, path: Path, *, epoch: int, metrics: dict[str, float]) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lora_adapter = _extract_adapter_state(
+            self.model,
+            include_pre_post=bool(self.config.train.train_pre_post),
         )
+        if not lora_adapter:
+            raise RuntimeError("No LoRA/pre-post adapter tensors were selected for checkpointing")
+        payload = {
+            "checkpoint_type": MULTICOIL_CHECKPOINT_TYPE,
+            "epoch": int(epoch),
+            "metrics": metrics or {},
+            "best_val_psnr": (
+                None if not np.isfinite(self.best_val_psnr) else float(self.best_val_psnr)
+            ),
+            "best_epoch": None if self.best_epoch is None else int(self.best_epoch),
+            "config": to_container(self.config),
+            "correction_adapter": {
+                key: value.detach().cpu()
+                for key, value in self.model.correction_adapter.state_dict().items()
+            },
+            "lora_adapter": lora_adapter,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        try:
+            torch.save(payload, tmp_path)
+            tmp_path.replace(path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        return path
 
     def _load_checkpoint(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(checkpoint_path, map_location="cpu")
-        self.model.load_state_dict(payload["model_state_dict"], strict=False)
+        if not _is_multicoil_checkpoint(payload):
+            raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
+        self.model.correction_adapter.load_state_dict(payload["correction_adapter"], strict=True)
+        lora_state = payload.get("lora_adapter", {})
+        if not lora_state:
+            raise RuntimeError(f"Checkpoint is missing LoRA/pre-post adapter tensors: {checkpoint_path}")
+        if not has_lora_adapters(self.model.base_model):
+            apply_lora_to_model(self.model.base_model, self.config.lora)
+        expected_lora_state = _extract_adapter_state(
+            self.model,
+            include_pre_post=bool(self.config.train.train_pre_post),
+        )
+        expected_keys = set(expected_lora_state)
+        saved_keys = set(lora_state)
+        missing_adapter_keys = sorted(expected_keys - saved_keys)
+        unexpected_adapter_keys = sorted(saved_keys - expected_keys)
+        if missing_adapter_keys or unexpected_adapter_keys:
+            raise RuntimeError(
+                "Adapter checkpoint keys do not match the current model/config: "
+                f"missing={missing_adapter_keys[:20]} unexpected={unexpected_adapter_keys[:20]}"
+            )
+        missing, unexpected = self.model.base_model.load_state_dict(lora_state, strict=False)
+        missing_loaded_keys = sorted(set(missing) & expected_keys)
+        if missing_loaded_keys or unexpected:
+            raise RuntimeError(
+                "Failed to load multicoil adapter checkpoint: "
+                f"missing={missing_loaded_keys[:20]} unexpected={unexpected[:20]}"
+            )
         if "optimizer_state_dict" in payload:
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        best_val_psnr = payload.get("best_val_psnr")
+        best_epoch = payload.get("best_epoch")
+        if best_val_psnr is not None:
+            self.best_val_psnr = float(best_val_psnr)
+            self.best_epoch = None if best_epoch is None else int(best_epoch)
+        else:
+            checkpoint_psnr = payload.get("metrics", {}).get("psnr") if isinstance(payload.get("metrics"), dict) else None
+            if checkpoint_psnr is not None and np.isfinite(float(checkpoint_psnr)):
+                self.best_val_psnr = float(checkpoint_psnr)
+                self.best_epoch = int(payload.get("epoch", -1))
         self.current_epoch = int(payload.get("epoch", -1)) + 1
 
     def fit(self) -> dict[str, Any]:
         save_resolved_config(self.config, self.run_dir / "config_resolved.yaml")
+        last_ckpt_path = self.run_dir / "last.pth"
+        best_ckpt_path = self.run_dir / "best_psnr.pth"
+        save_best_only = bool(self.config.train.save_best_only)
+        if save_best_only and self.val_loader is None:
+            raise ValueError("train.save_best_only=true requires a validation loader")
+        if not self.config.train.resume_from:
+            for stale_path in (last_ckpt_path, best_ckpt_path):
+                if stale_path.exists():
+                    stale_path.unlink()
         summary = {
             "run_dir": str(self.run_dir),
-            "best_val_psnr": None,
-            "best_checkpoint": None,
+            "best_val_psnr": None if not np.isfinite(self.best_val_psnr) else float(self.best_val_psnr),
+            "best_epoch": self.best_epoch,
+            "best_checkpoint": (
+                str(best_ckpt_path)
+                if save_best_only and self.best_epoch is not None and best_ckpt_path.exists()
+                else None
+            ),
+            "last_checkpoint": None if save_best_only else str(last_ckpt_path),
+            "save_best_only": save_best_only,
             "lora_wrapped": None if self.lora_result is None else self.lora_result.wrapped_names,
         }
         for epoch in range(self.current_epoch, int(self.config.train.max_epochs)):
@@ -570,11 +671,14 @@ class MulticoilFineTuneTrainer:
                 val_psnr = float(val_metrics.get("psnr", float("-inf")))
                 if val_psnr > self.best_val_psnr:
                     self.best_val_psnr = val_psnr
-                    self._save_checkpoint(self.run_dir / "best_psnr.pth", epoch=epoch, metrics=val_metrics)
+                    self.best_epoch = int(epoch)
+                    if save_best_only:
+                        self._save_checkpoint(best_ckpt_path, epoch=epoch, metrics=val_metrics)
                     summary["best_val_psnr"] = val_psnr
-                    summary["best_checkpoint"] = str(self.run_dir / "best_psnr.pth")
-            if not bool(self.config.train.save_best_only):
-                self._save_checkpoint(self.run_dir / f"epoch_{epoch:04d}.pth", epoch=epoch, metrics=train_metrics)
+                    summary["best_epoch"] = self.best_epoch
+                    summary["best_checkpoint"] = str(best_ckpt_path) if save_best_only else None
+            if not save_best_only:
+                self._save_checkpoint(last_ckpt_path, epoch=epoch, metrics=val_metrics)
             with (self.run_dir / "summary.json").open("w") as handle:
                 json.dump(summary, handle, indent=2, sort_keys=True)
         if self.config.train.run_test_eval and self.test_loader is not None:

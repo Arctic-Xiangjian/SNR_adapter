@@ -46,9 +46,8 @@ This repository contains the Pytorch code two of our papers:
 # install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# install git-lfs
 sudo apt update
-sudo apt install git-lfs direnv
+sudo apt install direnv
 ```
 
 Make sure commands `uv` are on your path.
@@ -70,9 +69,6 @@ git clone git@github.com:microsoft/SNRAware.git
 direnv allow
 cd ./SNRAware
 uv sync
-
-# pull down test data
-git lfs pull
 
 # run the test
 uv run pytest -m gpu ./test

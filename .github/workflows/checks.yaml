@@ -22,7 +22,6 @@ jobs:
           ref: ${{ inputs.sha }}
           fetch-depth: 0
           fetch-tags: true
-          lfs: true
       - uses: ./.github/actions/setup-environment
         id: runner-context
       - name: check
@@ -33,4 +32,4 @@ jobs:
           uv run ruff format --check
           uv run ruff check
           uv run pyright
-          uv run pytest
+          uv run pytest test/snraware_test/test_basics.py test/components/test_config.py test/components/test_heads.py

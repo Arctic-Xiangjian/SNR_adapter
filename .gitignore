@@ -4,6 +4,7 @@
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
 # Project2 training artifacts and local pretrained weights.
+*.npy
 /cache/
 /checkpoints/
 /runs/

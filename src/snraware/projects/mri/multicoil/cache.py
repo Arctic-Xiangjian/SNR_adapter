@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -62,28 +64,41 @@ def save_preprocess_cache(path: Path, result: MulticoilPreprocessResult) -> None
         payload["target_rss"] = result.target_rss.astype(np.float32)
     if result.mask_line is not None:
         payload["mask_line"] = result.mask_line.astype(bool)
-    np.savez_compressed(path, **payload)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez_compressed(tmp_path, **payload)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def load_preprocess_cache(path: Path) -> MulticoilPreprocessResult | None:
     """Load one preprocessed slice if present."""
     if not path.exists():
         return None
-    with np.load(path, allow_pickle=False) as cached:
-        metadata = json.loads(str(cached["metadata_json"].item()))
-        zero_filled = None
-        if "zero_filled_real" in cached and "zero_filled_imag" in cached:
-            zero_filled = cached["zero_filled_real"].astype(np.float32) + 1j * cached[
-                "zero_filled_imag"
-            ].astype(np.float32)
-        return MulticoilPreprocessResult(
-            noisy_complex=cached["noisy_real"].astype(np.float32)
-            + 1j * cached["noisy_imag"].astype(np.float32),
-            clean_complex=cached["clean_real"].astype(np.float32)
-            + 1j * cached["clean_imag"].astype(np.float32),
-            gmap=cached["gmap"].astype(np.float32),
-            metadata=metadata,
-            zero_filled_complex=zero_filled,
-            target_rss=cached["target_rss"].astype(np.float32) if "target_rss" in cached else None,
-            mask_line=cached["mask_line"].astype(bool) if "mask_line" in cached else None,
-        )
+    try:
+        with np.load(path, allow_pickle=False) as cached:
+            metadata = json.loads(str(cached["metadata_json"].item()))
+            zero_filled = None
+            if "zero_filled_real" in cached and "zero_filled_imag" in cached:
+                zero_filled = cached["zero_filled_real"].astype(np.float32) + 1j * cached[
+                    "zero_filled_imag"
+                ].astype(np.float32)
+            return MulticoilPreprocessResult(
+                noisy_complex=cached["noisy_real"].astype(np.float32)
+                + 1j * cached["noisy_imag"].astype(np.float32),
+                clean_complex=cached["clean_real"].astype(np.float32)
+                + 1j * cached["clean_imag"].astype(np.float32),
+                gmap=cached["gmap"].astype(np.float32),
+                metadata=metadata,
+                zero_filled_complex=zero_filled,
+                target_rss=cached["target_rss"].astype(np.float32) if "target_rss" in cached else None,
+                mask_line=cached["mask_line"].astype(bool) if "mask_line" in cached else None,
+            )
+    except (OSError, ValueError, zipfile.BadZipFile):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return None

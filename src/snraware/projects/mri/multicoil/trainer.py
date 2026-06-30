@@ -24,7 +24,7 @@ from .lora import (
 from .metrics import (
     complex_magnitude,
     compute_volume_metrics,
-    current_magnitude_mean,
+    current_magnitude_max,
     restore_magnitude_volumes,
 )
 from .sliding_window import predict_sliding_window_3d
@@ -268,7 +268,7 @@ class MulticoilFineTuneTrainer:
     def _loss(self, pred: torch.Tensor, clean: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
         if pred.ndim != 5 or clean.ndim != 5 or noisy.ndim != 5:
             raise ValueError("3D multicoil loss accepts only [B,C,D,H,W] tensors")
-        scale = current_magnitude_mean(noisy).to(device=pred.device, dtype=pred.dtype)
+        scale = current_magnitude_max(noisy).to(device=pred.device, dtype=pred.dtype)
         complex_loss = self.loss_fn(pred / scale, clean / scale)
         magnitude_loss = self.loss_fn(complex_magnitude(pred) / scale, complex_magnitude(clean) / scale)
         return (

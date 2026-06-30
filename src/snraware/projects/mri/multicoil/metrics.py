@@ -15,14 +15,14 @@ def complex_magnitude(x: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(x[:, 0:1].square() + x[:, 1:2].square())
 
 
-def current_magnitude_mean(noisy: torch.Tensor) -> torch.Tensor:
-    """Per-sample current magnitude mean with shape [B,1,1,1,1]."""
+def current_magnitude_max(noisy: torch.Tensor) -> torch.Tensor:
+    """Per-sample current magnitude max with shape [B,1,1,1,1]."""
     if noisy.ndim != 5 or noisy.shape[1] < 2:
         raise ValueError(f"Expected [B, C>=2, D, H, W], got {tuple(noisy.shape)}")
     magnitude = torch.sqrt(noisy[:, 0:1].square() + noisy[:, 1:2].square())
-    scale = magnitude.mean(dim=(-3, -2, -1), keepdim=True)
+    scale = magnitude.amax(dim=(-3, -2, -1), keepdim=True)
     if not torch.isfinite(scale).all():
-        raise ValueError("Current-mean loss normalization received non-finite scale")
+        raise ValueError("Current-max loss normalization received non-finite scale")
     return torch.where(scale == 0, torch.ones_like(scale), scale)
 
 

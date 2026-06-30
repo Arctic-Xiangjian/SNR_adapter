@@ -4,21 +4,23 @@ import torch
 from snraware.projects.mri.multicoil.metrics import (
     complex_magnitude,
     compute_volume_metrics,
-    current_magnitude_mean,
+    current_magnitude_max,
     restore_magnitude_volumes,
 )
 
 
-def test_5d_magnitude_and_current_scale_shapes():
+def test_5d_magnitude_and_current_max_scale_shapes():
     pred = torch.zeros(2, 2, 16, 8, 8)
     pred[:, 0] = 3.0
     pred[:, 1] = 4.0
     noisy = torch.zeros(2, 3, 16, 8, 8)
-    noisy[:, 0] = 6.0
-    noisy[:, 1] = 8.0
+    noisy[:, 0] = 0.6
+    noisy[:, 1] = 0.8
+    noisy[:, 0, 0, 0, 0] = 6.0
+    noisy[:, 1, 0, 0, 0] = 8.0
 
     mag = complex_magnitude(pred)
-    scale = current_magnitude_mean(noisy)
+    scale = current_magnitude_max(noisy)
 
     assert tuple(mag.shape) == (2, 1, 16, 8, 8)
     assert tuple(scale.shape) == (2, 1, 1, 1, 1)

@@ -1,4 +1,4 @@
-"""H5 dataset bridge for pure multicoil SNRAware training."""
+"""Volume-stacking dataset for 3D-only multicoil SNRAware training."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .cache import cache_path_for_slice, load_preprocess_cache, save_preprocess_cache
-from .config import H5DataConfig, PreprocessConfig, SubsetConfig
+from .config import H5DataConfig, PatchShape3D, PreprocessConfig, SubsetConfig
 from .physics import MulticoilPreprocessResult, preprocess_multicoil_slice
 
 
@@ -27,6 +27,14 @@ class SliceRef:
     source_fingerprint: str
 
 
+@dataclass(frozen=True)
+class VolumeRef:
+    """Reference to a full source volume."""
+
+    volume_name: str
+    slices: tuple[SliceRef, ...]
+
+
 def _file_fingerprint(path: Path) -> str:
     stat = path.stat()
     return f"{stat.st_size}:{int(stat.st_mtime_ns)}"
@@ -35,7 +43,7 @@ def _file_fingerprint(path: Path) -> str:
 def _expand_h5_roots(roots: list[str]) -> list[Path]:
     files: list[Path] = []
     for root_text in roots:
-        root = Path(root_text)
+        root = Path(root_text).expanduser()
         if root.is_file():
             files.append(root)
         elif root.is_dir():
@@ -79,7 +87,7 @@ def _read_target_slice(handle: h5py.File, data_cfg: H5DataConfig, slice_idx: int
     return target.astype(np.float32, copy=False)
 
 
-def _tensorize_result(result: MulticoilPreprocessResult) -> dict[str, Any]:
+def _tensorize_slice_result(result: MulticoilPreprocessResult) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     noisy = np.stack(
         [result.noisy_complex.real, result.noisy_complex.imag, result.gmap],
         axis=0,
@@ -89,24 +97,16 @@ def _tensorize_result(result: MulticoilPreprocessResult) -> dict[str, Any]:
         axis=0,
     ).astype(np.float32)
     metadata = dict(result.metadata)
-    volume_name = str(metadata.get("volume_name", "unknown_volume"))
-    slice_idx = int(metadata.get("slice_idx", -1))
-    metadata.setdefault("name", f"{volume_name}_slice_{slice_idx}")
-    metadata.setdefault("volume_name", volume_name)
-    metadata.setdefault("slice_idx", slice_idx)
-    metadata.setdefault("mean", 0.0)
-    metadata.setdefault("std", float(metadata.get("scale", 1.0)))
-    if result.target_rss is not None:
-        metadata["target_rss"] = torch.from_numpy(np.asarray(result.target_rss, dtype=np.float32)).contiguous()
-    return {
-        "noisy": torch.from_numpy(noisy).contiguous(),
-        "clean": torch.from_numpy(clean).contiguous(),
-        "metadata": metadata,
-    }
+    metadata.setdefault("scale", 1.0)
+    return (
+        torch.from_numpy(noisy).contiguous(),
+        torch.from_numpy(clean).contiguous(),
+        metadata,
+    )
 
 
-class MulticoilH5Dataset(Dataset):
-    """Dataset emitting [real, imag, ones-gmap] inputs and complex targets."""
+class MulticoilVolumeDataset(Dataset):
+    """Emit 3D training windows or full validation/test volumes."""
 
     def __init__(
         self,
@@ -114,19 +114,19 @@ class MulticoilH5Dataset(Dataset):
         preprocess_config: PreprocessConfig,
         *,
         split: str,
+        patch_shape: PatchShape3D,
         subset: SubsetConfig | None = None,
-        train_patch_size: list[int] | tuple[int, int] | None = None,
     ):
         super().__init__()
         self.data_config = data_config
         self.preprocess_config = preprocess_config
-        self.split = split
-        self.train_patch_size = None if train_patch_size is None else tuple(int(v) for v in train_patch_size)
+        self.split = str(split)
+        self.patch_shape = PatchShape3D.from_value(patch_shape)
 
         files = _expand_h5_roots(data_config.roots)
         if not files:
             raise ValueError(f"No H5 files found for split={split}")
-        refs: list[SliceRef] = []
+        volumes: list[VolumeRef] = []
         for path in files:
             with h5py.File(path, "r") as handle:
                 if data_config.kspace_key not in handle:
@@ -135,7 +135,7 @@ class MulticoilH5Dataset(Dataset):
             if data_config.max_slices is not None:
                 num_slices = min(num_slices, int(data_config.max_slices))
             source_fingerprint = _file_fingerprint(path)
-            refs.extend(
+            slices = tuple(
                 SliceRef(
                     path=path,
                     volume_name=path.stem,
@@ -144,49 +144,64 @@ class MulticoilH5Dataset(Dataset):
                 )
                 for slice_idx in range(num_slices)
             )
+            if len(slices) < self.patch_shape.depth:
+                raise ValueError(
+                    f"Volume {path} has D={len(slices)} but train.patch.depth={self.patch_shape.depth}"
+                )
+            volumes.append(VolumeRef(volume_name=path.stem, slices=slices))
 
-        refs = self._apply_volume_sample_fraction(refs, data_config)
-        if subset is not None and split == "train":
-            refs = self._apply_training_subset(refs, subset)
-        self.refs = refs
+        volumes = self._apply_volume_sample_fraction(volumes, data_config)
+        if subset is not None and self.split == "train":
+            volumes = self._apply_training_subset(volumes, subset)
+        self.volumes = volumes
         self.dataset_info = {
-            "split": split,
-            "num_slices": len(self.refs),
-            "num_volumes": len({ref.volume_name for ref in self.refs}),
+            "split": self.split,
+            "num_volumes": len(self.volumes),
+            "num_slices": sum(len(volume.slices) for volume in self.volumes),
             "roots": list(data_config.roots),
             "format": data_config.format,
+            "shape_contract": "[B,C,D,H,W]",
+            "patch": {
+                "depth": self.patch_shape.depth,
+                "height": self.patch_shape.height,
+                "width": self.patch_shape.width,
+            },
         }
 
     @staticmethod
-    def _apply_volume_sample_fraction(refs: list[SliceRef], data_config: H5DataConfig) -> list[SliceRef]:
+    def _apply_volume_sample_fraction(
+        volumes: list[VolumeRef],
+        data_config: H5DataConfig,
+    ) -> list[VolumeRef]:
         fraction = data_config.volume_sample_fraction
         if fraction is None:
-            return refs
+            return volumes
         if not (0.0 < float(fraction) <= 1.0):
             raise ValueError(f"volume_sample_fraction must be in (0, 1], got {fraction}")
-        volumes = sorted({ref.volume_name for ref in refs})
         rng = random.Random(int(data_config.volume_sample_seed))
-        rng.shuffle(volumes)
-        selected = set(volumes[: max(1, round(len(volumes) * float(fraction)))])
-        return [ref for ref in refs if ref.volume_name in selected]
+        shuffled = list(volumes)
+        rng.shuffle(shuffled)
+        selected_names = {
+            volume.volume_name for volume in shuffled[: max(1, round(len(shuffled) * float(fraction)))]
+        }
+        return [volume for volume in volumes if volume.volume_name in selected_names]
 
     @staticmethod
-    def _apply_training_subset(refs: list[SliceRef], subset: SubsetConfig) -> list[SliceRef]:
+    def _apply_training_subset(volumes: list[VolumeRef], subset: SubsetConfig) -> list[VolumeRef]:
         if subset.mode == "none":
-            return refs
-        rng = random.Random(int(subset.seed))
+            return volumes
         if subset.mode == "random_slice":
-            indexed = list(enumerate(refs))
-            rng.shuffle(indexed)
-            selected_indices = sorted(index for index, _ in indexed[: max(1, round(len(refs) * float(subset.fraction)))])
-            return [refs[index] for index in selected_indices]
-        volumes = sorted({ref.volume_name for ref in refs})
-        rng.shuffle(volumes)
-        selected = set(volumes[: max(1, round(len(volumes) * float(subset.fraction)))])
-        return [ref for ref in refs if ref.volume_name in selected]
+            raise ValueError("The 3D multicoil pipeline does not support random_slice subsets")
+        rng = random.Random(int(subset.seed))
+        shuffled = list(volumes)
+        rng.shuffle(shuffled)
+        selected_names = {
+            volume.volume_name for volume in shuffled[: max(1, round(len(shuffled) * float(subset.fraction)))]
+        }
+        return [volume for volume in volumes if volume.volume_name in selected_names]
 
     def __len__(self) -> int:
-        return len(self.refs)
+        return len(self.volumes)
 
     def _load_or_preprocess(self, ref: SliceRef) -> MulticoilPreprocessResult:
         cache_path = cache_path_for_slice(
@@ -217,30 +232,72 @@ class MulticoilH5Dataset(Dataset):
             save_preprocess_cache(cache_path, result)
         return result
 
-    def _maybe_crop_patch(self, sample: dict[str, Any]) -> dict[str, Any]:
-        if self.split != "train" or self.train_patch_size is None:
-            return sample
-        patch_h, patch_w = self.train_patch_size
-        noisy = sample["noisy"]
-        clean = sample["clean"]
+    def _stack_refs(self, refs: tuple[SliceRef, ...]) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        noisy_slices: list[torch.Tensor] = []
+        clean_slices: list[torch.Tensor] = []
+        metadata: list[dict[str, Any]] = []
+        for ref in refs:
+            noisy, clean, slice_metadata = _tensorize_slice_result(self._load_or_preprocess(ref))
+            noisy_slices.append(noisy)
+            clean_slices.append(clean)
+            metadata.append(slice_metadata)
+        noisy_volume = torch.stack(noisy_slices, dim=1)
+        clean_volume = torch.stack(clean_slices, dim=1)
+        return noisy_volume, clean_volume, metadata
+
+    def _metadata_for_refs(
+        self,
+        volume: VolumeRef,
+        refs: tuple[SliceRef, ...],
+        slice_metadata: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "volume_name": volume.volume_name,
+            "z_indices": [int(ref.slice_idx) for ref in refs],
+            "slice_scales": [float(item.get("scale", item.get("std", 1.0))) for item in slice_metadata],
+        }
+
+    def _train_sample(self, volume: VolumeRef) -> dict[str, Any]:
+        depth = self.patch_shape.depth
+        max_start = len(volume.slices) - depth
+        z_start = int(torch.randint(0, max_start + 1, ()).item())
+        refs = volume.slices[z_start : z_start + depth]
+        noisy, clean, slice_metadata = self._stack_refs(refs)
         full_h, full_w = clean.shape[-2:]
+        patch_h, patch_w = self.patch_shape.height, self.patch_shape.width
         if patch_h > full_h or patch_w > full_w:
-            raise ValueError(f"train_patch_size {self.train_patch_size} must fit inside {(full_h, full_w)}")
+            raise ValueError(f"train.patch {(depth, patch_h, patch_w)} must fit inside {(depth, full_h, full_w)}")
         top = int(torch.randint(0, full_h - patch_h + 1, ()).item())
         left = int(torch.randint(0, full_w - patch_w + 1, ()).item())
-        out = dict(sample)
-        out["noisy"] = noisy[..., top : top + patch_h, left : left + patch_w]
-        out["clean"] = clean[..., top : top + patch_h, left : left + patch_w]
-        out["metadata"] = dict(sample["metadata"])
-        out["metadata"]["patch_top"] = top
-        out["metadata"]["patch_left"] = left
-        out["metadata"]["patch_size"] = [patch_h, patch_w]
-        return out
+        metadata = self._metadata_for_refs(volume, refs, slice_metadata)
+        metadata.update(
+            {
+                "z_start": int(refs[0].slice_idx),
+                "patch_top": top,
+                "patch_left": left,
+                "patch": {
+                    "depth": depth,
+                    "height": patch_h,
+                    "width": patch_w,
+                },
+            }
+        )
+        return {
+            "noisy": noisy[:, :, top : top + patch_h, left : left + patch_w],
+            "clean": clean[:, :, top : top + patch_h, left : left + patch_w],
+            "metadata": metadata,
+        }
+
+    def _volume_sample(self, volume: VolumeRef) -> dict[str, Any]:
+        noisy, clean, slice_metadata = self._stack_refs(volume.slices)
+        metadata = self._metadata_for_refs(volume, volume.slices, slice_metadata)
+        return {"noisy": noisy, "clean": clean, "metadata": metadata}
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        ref = self.refs[int(index)]
-        sample = _tensorize_result(self._load_or_preprocess(ref))
-        return self._maybe_crop_patch(sample)
+        volume = self.volumes[int(index)]
+        if self.split == "train":
+            return self._train_sample(volume)
+        return self._volume_sample(volume)
 
 
 def collate_multicoil_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:

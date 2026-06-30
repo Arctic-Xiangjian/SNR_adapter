@@ -174,7 +174,7 @@ class CorrectionConfig:
     """Bounded trainable correction on [real, imag, ones-gmap]."""
 
     enabled: bool = True
-    hidden_chans: int = 64
+    hidden_chans: int = 32
     gmap_log_bound: float = 1.75
     complex_log_scale_bound: float = 0.75
     gmap_min: float = 0.01
@@ -183,6 +183,63 @@ class CorrectionConfig:
     def __post_init__(self) -> None:
         if not bool(self.enabled):
             raise ValueError("This training-only project requires correction.enabled=true")
+
+
+@dataclass(frozen=True)
+class PatchShape3D:
+    """SNRAware 3D patch shape in tensor order D/H/W."""
+
+    depth: int = 16
+    height: int = 64
+    width: int = 64
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "depth", int(self.depth))
+        object.__setattr__(self, "height", int(self.height))
+        object.__setattr__(self, "width", int(self.width))
+        if min(self.depth, self.height, self.width) <= 0:
+            raise ValueError("patch depth/height/width must be positive")
+
+    @classmethod
+    def from_value(cls, value: PatchShape3D | dict[str, Any]) -> PatchShape3D:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        raise TypeError("train.patch must use named fields: depth, height, width")
+
+    def as_tensor_dhw(self) -> tuple[int, int, int]:
+        return (self.depth, self.height, self.width)
+
+    def as_snraware_cutout_hwd(self) -> list[int]:
+        return [self.height, self.width, self.depth]
+
+
+@dataclass(frozen=True)
+class OverlapShape3D:
+    """3D sliding-window overlap in tensor order D/H/W."""
+
+    depth: int = 8
+    height: int = 16
+    width: int = 16
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "depth", int(self.depth))
+        object.__setattr__(self, "height", int(self.height))
+        object.__setattr__(self, "width", int(self.width))
+        if min(self.depth, self.height, self.width) < 0:
+            raise ValueError("inference overlap depth/height/width must be non-negative")
+
+    @classmethod
+    def from_value(cls, value: OverlapShape3D | dict[str, Any]) -> OverlapShape3D:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        raise TypeError("train.inference_overlap must use named fields: depth, height, width")
+
+    def as_tensor_dhw(self) -> tuple[int, int, int]:
+        return (self.depth, self.height, self.width)
 
 
 @dataclass
@@ -225,14 +282,15 @@ class TrainConfig:
     max_epochs: int = 50
     warmup_epochs: int = 4
     gmap_warmup_epochs: int = 2
-    batch_size: int = 48
+    batch_size: int = 2
+    val_batch_size: int = 1
     num_workers: int = 4
     pin_memory: bool = True
     persistent_workers: bool = True
     shuffle_train: bool = True
-    train_patch_size: list[int] = field(default_factory=lambda: [64, 64])
-    eval_patch_batch_size: int = 64
-    overlap_for_inference: list[int] = field(default_factory=lambda: [16, 16, 0])
+    patch: PatchShape3D | dict[str, Any] = field(default_factory=PatchShape3D)
+    inference_overlap: OverlapShape3D | dict[str, Any] = field(default_factory=OverlapShape3D)
+    eval_patch_batch_size: int = 8
     gradient_checkpoint_frozen_base: bool = True
     frozen_base_eval: bool = True
     correction_lr: float = 5.0e-4
@@ -251,25 +309,24 @@ class TrainConfig:
     run_test_eval: bool = False
 
     def __post_init__(self) -> None:
-        self.train_patch_size = [int(v) for v in self.train_patch_size]
-        self.overlap_for_inference = [int(v) for v in self.overlap_for_inference]
+        self.patch = PatchShape3D.from_value(self.patch)
+        self.inference_overlap = OverlapShape3D.from_value(self.inference_overlap)
         if self.mode != "warmup_then_both":
             raise ValueError("This clean project keeps only mode='warmup_then_both'")
         if self.gmap_warmup_epochs > self.warmup_epochs:
             raise ValueError("train.gmap_warmup_epochs must be <= train.warmup_epochs")
-        if len(self.train_patch_size) != 2:
-            raise ValueError("train.train_patch_size must be [height, width]")
-        if len(self.overlap_for_inference) < 2:
-            raise ValueError("train.overlap_for_inference must provide at least [height, width]")
+        if int(self.batch_size) <= 0:
+            raise ValueError("train.batch_size must be positive")
+        if int(self.val_batch_size) != 1:
+            raise ValueError("3D validation/test dataloaders require train.val_batch_size=1")
         if self.eval_patch_batch_size <= 0:
             raise ValueError("train.eval_patch_batch_size must be positive")
-        if self.overlap_for_inference[0] < 0 or self.overlap_for_inference[1] < 0:
-            raise ValueError("train.overlap_for_inference must be non-negative")
         if (
-            self.overlap_for_inference[0] >= self.train_patch_size[0]
-            or self.overlap_for_inference[1] >= self.train_patch_size[1]
+            self.inference_overlap.depth >= self.patch.depth
+            or self.inference_overlap.height >= self.patch.height
+            or self.inference_overlap.width >= self.patch.width
         ):
-            raise ValueError("train.overlap_for_inference must be smaller than train.train_patch_size")
+            raise ValueError("train.inference_overlap must be smaller than train.patch")
 
 
 @dataclass
@@ -280,7 +337,7 @@ class RuntimeConfig:
     use_bf16: bool = True
     seed: int = 3875032963
     save_root: str = "/working2/arctic/project2/runs"
-    run_name: str = "fastmri_x8_cf004_partial05_gmap_ones"
+    run_name: str = "fastmri_x8_cf004_partial05_3d_d16_gmap_ones"
 
 
 @dataclass

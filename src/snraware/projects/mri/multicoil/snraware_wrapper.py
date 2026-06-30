@@ -1,4 +1,4 @@
-"""SNRAware model wrapper for native multicoil inputs."""
+"""SNRAware model wrapper for native 3D multicoil inputs."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from snraware.projects.mri.denoising.model import DenoisingModel
 
-from .adapter import PhysicsCorrectionAdapter
-from .config import BaseModelConfig, CorrectionConfig, PreprocessConfig, TrainConfig
+from .config import BaseModelConfig, CorrectionConfig, PatchShape3D, PreprocessConfig, TrainConfig
+from .gmap_adapter import GFactorCorrectionAdapter3D
 
 TARGET_REPLACEMENTS = {
     "ifm.model.config.": "snraware.components.model.config.",
@@ -33,13 +33,13 @@ def _replace_legacy_targets(obj: Any) -> Any:
     return obj
 
 
-def load_base_model_config(config_path: str | Path, model_spatial_size: tuple[int, int]) -> DictConfig:
-    """Load base SNRAware YAML and adapt only the spatial cutout shape."""
+def load_base_model_config(config_path: str | Path, patch_shape: PatchShape3D) -> DictConfig:
+    """Load base SNRAware YAML and adapt the 3D cutout shape."""
     raw = OmegaConf.load(config_path)
     fixed = OmegaConf.create(_replace_legacy_targets(OmegaConf.to_container(raw, resolve=False)))
     if not isinstance(fixed, DictConfig):
         raise TypeError(f"Expected DictConfig, got {type(fixed).__name__}")
-    fixed.dataset.cutout_shape = [int(model_spatial_size[0]), int(model_spatial_size[1]), 1]
+    fixed.dataset.cutout_shape = patch_shape.as_snraware_cutout_hwd()
     return fixed
 
 
@@ -94,26 +94,19 @@ def _shape_compatible_state(
     return compatible, skipped, mismatch_keys, missing_model_keys
 
 
-def _resolve_model_spatial_size(train_config: TrainConfig) -> tuple[int, int]:
-    patch_size = tuple(int(v) for v in train_config.train_patch_size)
-    if len(patch_size) != 2:
-        raise ValueError(f"train.train_patch_size must contain exactly two values, got {patch_size}")
-    return patch_size
-
-
 def build_base_model(
     base_config: BaseModelConfig,
     preprocess: PreprocessConfig,
     train_config: TrainConfig,
 ) -> tuple[DenoisingModel, DictConfig]:
-    """Instantiate SNRAware base model and require SOTA-compatible weight loading."""
-    model_spatial_size = _resolve_model_spatial_size(train_config)
-    model_config = load_base_model_config(base_config.config_path, model_spatial_size)
+    """Instantiate SNRAware base model and require strict-compatible weights."""
+    patch = train_config.patch
+    model_config = load_base_model_config(base_config.config_path, patch)
     model = DenoisingModel(
         config=model_config,
-        D=1,
-        H=int(model_spatial_size[0]),
-        W=int(model_spatial_size[1]),
+        D=patch.depth,
+        H=patch.height,
+        W=patch.width,
         C_in=3,
         C_out=2,
     )
@@ -122,10 +115,10 @@ def build_base_model(
     if mismatch_keys or missing_model_keys:
         examples = (mismatch_keys + [f"missing: {key}" for key in missing_model_keys])[:20]
         raise RuntimeError(
-            "Base checkpoint does not fully match the SNRAware model shape. "
+            "Base checkpoint does not fully match the 3D SNRAware model shape. "
             f"matched={len(compatible)} mismatched={len(mismatch_keys)} "
-            f"missing_model_keys={len(missing_model_keys)} model_spatial_size={model_spatial_size} "
-            f"examples={examples}"
+            f"missing_model_keys={len(missing_model_keys)} patch={patch.as_tensor_dhw()} "
+            f"mismatched_or_missing_examples={examples}"
         )
     missing, unexpected = model.load_state_dict(compatible, strict=True)
     model.load_report = {
@@ -135,23 +128,31 @@ def build_base_model(
         "skipped_tensors": len(skipped),
         "missing_tensors": len(missing),
         "unexpected_tensors": len(unexpected),
-        "model_spatial_size": [int(model_spatial_size[0]), int(model_spatial_size[1])],
+        "patch": {
+            "depth": patch.depth,
+            "height": patch.height,
+            "width": patch.width,
+        },
+        "model_cutout_shape": patch.as_snraware_cutout_hwd(),
         "eval_crop_size": [int(preprocess.crop_size[0]), int(preprocess.crop_size[1])],
     }
     return model, model_config
 
 
 class SNRAwareMulticoilWrapper(nn.Module):
-    """Frozen SNRAware base plus optional physics correction adapter."""
+    """Frozen SNRAware base plus 3D gmap correction adapter."""
 
     def __init__(
         self,
-        base_model: DenoisingModel,
+        base_model: nn.Module,
         correction_config: CorrectionConfig,
+        *,
+        patch_shape: PatchShape3D,
     ):
         super().__init__()
         self.base_model = base_model
-        self.correction_adapter = PhysicsCorrectionAdapter(correction_config)
+        self.patch_shape = PatchShape3D.from_value(patch_shape)
+        self.gmap_adapter = GFactorCorrectionAdapter3D(correction_config)
         self.use_correction = bool(correction_config.enabled)
         self.last_correction_stats: dict[str, float] | None = None
 
@@ -159,22 +160,26 @@ class SNRAwareMulticoilWrapper(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+    def _validate_input(self, x: torch.Tensor) -> None:
+        expected = (3, self.patch_shape.depth, self.patch_shape.height, self.patch_shape.width)
+        if x.ndim != 5 or tuple(x.shape[1:]) != expected:
+            raise ValueError(f"Expected [B, 3, D, H, W] with tail {expected}, got {tuple(x.shape)}")
+
     def forward(self, x: torch.Tensor, *, checkpoint_base_model: bool = False) -> torch.Tensor:
-        if x.ndim != 4 or x.shape[1] != 3:
-            raise ValueError(f"Expected [B, 3, H, W], got {tuple(x.shape)}")
+        self._validate_input(x)
         if self.use_correction:
-            x = self.correction_adapter(x)
-            self.last_correction_stats = self.correction_adapter.last_stats
+            x = self.gmap_adapter(x)
+            self.last_correction_stats = self.gmap_adapter.last_stats
         else:
             self.last_correction_stats = None
-        base_input = x.unsqueeze(2)
         if bool(checkpoint_base_model) and torch.is_grad_enabled():
-            y = activation_checkpoint(lambda value: self.base_model(value), base_input, use_reentrant=False)
+            y = activation_checkpoint(lambda value: self.base_model(value), x, use_reentrant=False)
         else:
-            y = self.base_model(base_input)
-        if y.ndim != 5 or y.shape[2] != 1:
-            raise ValueError(f"Expected SNRAware output [B, 2, 1, H, W], got {tuple(y.shape)}")
-        return y.squeeze(2)
+            y = self.base_model(x)
+        expected = (2, self.patch_shape.depth, self.patch_shape.height, self.patch_shape.width)
+        if y.ndim != 5 or tuple(y.shape[1:]) != expected:
+            raise ValueError(f"Expected SNRAware output [B, 2, D, H, W] with tail {expected}, got {tuple(y.shape)}")
+        return y
 
 
 def build_multicoil_model(
@@ -184,6 +189,13 @@ def build_multicoil_model(
     preprocess_config: PreprocessConfig,
     train_config: TrainConfig,
 ) -> tuple[SNRAwareMulticoilWrapper, DictConfig]:
-    """Build the wrapped multicoil model."""
+    """Build the wrapped 3D multicoil model."""
     base_model, model_config = build_base_model(base_config, preprocess_config, train_config)
-    return SNRAwareMulticoilWrapper(base_model, correction_config), model_config
+    return (
+        SNRAwareMulticoilWrapper(
+            base_model,
+            correction_config,
+            patch_shape=train_config.patch,
+        ),
+        model_config,
+    )

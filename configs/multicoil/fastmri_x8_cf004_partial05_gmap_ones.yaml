@@ -52,7 +52,7 @@ base_model:
 
 correction:
   enabled: true
-  hidden_chans: 64
+  hidden_chans: 32
   gmap_log_bound: 1.75
   complex_log_scale_bound: 0.75
   gmap_min: 0.01
@@ -76,14 +76,21 @@ train:
   max_epochs: 50
   warmup_epochs: 4
   gmap_warmup_epochs: 2
-  batch_size: 48
+  batch_size: 2
+  val_batch_size: 1
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   shuffle_train: true
-  train_patch_size: [64, 64]
-  eval_patch_batch_size: 64
-  overlap_for_inference: [16, 16, 0]
+  patch:
+    depth: 16
+    height: 64
+    width: 64
+  inference_overlap:
+    depth: 8
+    height: 16
+    width: 16
+  eval_patch_batch_size: 8
   gradient_checkpoint_frozen_base: true
   frozen_base_eval: true
   correction_lr: 0.0005
@@ -106,4 +113,4 @@ runtime:
   use_bf16: true
   seed: 3875032963
   save_root: /working2/arctic/project2/runs
-  run_name: fastmri_x8_cf004_partial05_gmap_ones
+  run_name: fastmri_x8_cf004_partial05_3d_d16_gmap_ones

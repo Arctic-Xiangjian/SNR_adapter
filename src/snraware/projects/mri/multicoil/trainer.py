@@ -1,11 +1,10 @@
-"""Explicit multicoil fine-tuning loop."""
+"""Explicit 3D multicoil fine-tuning loop."""
 
 from __future__ import annotations
 
 import csv
 import json
 import random
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -14,19 +13,26 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .adapter import (
+from .config import ProjectConfig, save_resolved_config, to_container
+from .lora import (
     apply_lora_to_model,
     count_trainable_parameters,
     has_lora_adapters,
     lora_parameters,
     set_lora_trainable,
 )
-from .config import ProjectConfig, save_resolved_config, to_container
-from .h5_dataset import MulticoilH5Dataset, collate_multicoil_batch
+from .metrics import (
+    complex_magnitude,
+    compute_volume_metrics,
+    current_magnitude_mean,
+    restore_magnitude_volumes,
+)
+from .sliding_window import predict_sliding_window_3d
 from .snraware_wrapper import SNRAwareMulticoilWrapper, build_multicoil_model
+from .volume_dataset import MulticoilVolumeDataset, collate_multicoil_batch
 
-
-MULTICOIL_CHECKPOINT_TYPE = "snraware_project2_multicoil_v1"
+MULTICOIL_CHECKPOINT_TYPE = "snraware_multicoil_3d_v1"
+SHAPE_CONTRACT = "[B,C,D,H,W]"
 
 
 def _extract_adapter_state(
@@ -58,121 +64,6 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def complex_magnitude(x: torch.Tensor) -> torch.Tensor:
-    """Convert [B, 2, H, W] complex tensor to [B, 1, H, W] magnitude."""
-    if x.ndim != 4 or x.shape[1] != 2:
-        raise ValueError(f"Expected [B, 2, H, W], got {tuple(x.shape)}")
-    return torch.sqrt(x[:, 0:1].square() + x[:, 1:2].square())
-
-
-def simple_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """Compute a simple batch PSNR in magnitude domain."""
-    pred_mag = complex_magnitude(pred).detach().float()
-    target_mag = complex_magnitude(target).detach().float()
-    mse = torch.mean((pred_mag - target_mag) ** 2)
-    peak = torch.amax(target_mag).clamp_min(1.0e-6)
-    return float((20.0 * torch.log10(peak) - 10.0 * torch.log10(mse.clamp_min(1.0e-12))).item())
-
-
-def simple_nmse(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """Compute NMSE in magnitude domain."""
-    pred_mag = complex_magnitude(pred).detach().float()
-    target_mag = complex_magnitude(target).detach().float()
-    numerator = torch.sum((pred_mag - target_mag) ** 2)
-    denominator = torch.sum(target_mag**2).clamp_min(1.0e-12)
-    return float((numerator / denominator).item())
-
-
-def fastmri_current_magnitude_mean(noisy: torch.Tensor) -> torch.Tensor:
-    """Per-sample scale used by the old FastMRI fine-tune loss."""
-    if noisy.ndim != 4 or noisy.shape[1] < 2:
-        raise ValueError(f"Expected [B, C>=2, H, W], got {tuple(noisy.shape)}")
-    magnitude = torch.sqrt(noisy[:, 0:1].square() + noisy[:, 1:2].square())
-    scale = magnitude.mean(dim=(-2, -1), keepdim=True)
-    if not torch.isfinite(scale).all():
-        raise ValueError("Current-mean loss normalization received non-finite scale")
-    return torch.where(scale == 0, torch.ones_like(scale), scale)
-
-
-def _metric_nmse(target: np.ndarray, prediction: np.ndarray) -> float:
-    numerator = float(np.sum((prediction - target) ** 2))
-    denominator = float(np.sum(target**2))
-    return numerator / max(denominator, 1.0e-12)
-
-
-def _metric_psnr(target: np.ndarray, prediction: np.ndarray) -> float:
-    mse = float(np.mean((prediction - target) ** 2))
-    peak = float(np.max(target))
-    return 20.0 * np.log10(max(peak, 1.0e-6)) - 10.0 * np.log10(max(mse, 1.0e-12))
-
-
-def _metric_ssim(target: np.ndarray, prediction: np.ndarray) -> float:
-    try:
-        from skimage.metrics import structural_similarity
-    except Exception:
-        structural_similarity = None
-
-    if prediction.ndim == 3:
-        values = [_metric_ssim(target[index], prediction[index]) for index in range(prediction.shape[0])]
-        return float(np.mean(values)) if values else float("nan")
-    data_range = float(np.max(target) - np.min(target))
-    if data_range <= 0:
-        return float("nan")
-    if structural_similarity is not None:
-        return float(structural_similarity(target, prediction, data_range=data_range))
-    pred64 = prediction.astype(np.float64, copy=False)
-    target64 = target.astype(np.float64, copy=False)
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
-    mu_x = float(pred64.mean())
-    mu_y = float(target64.mean())
-    var_x = float(pred64.var())
-    var_y = float(target64.var())
-    cov_xy = float(((pred64 - mu_x) * (target64 - mu_y)).mean())
-    return ((2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)) / (
-        (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
-    )
-
-
-def _volume_metric_fns():
-    try:
-        from fastmri.evaluate import nmse, psnr, ssim
-    except Exception:
-        return {"psnr": _metric_psnr, "ssim": _metric_ssim, "nmse": _metric_nmse}
-    return {"psnr": psnr, "ssim": ssim, "nmse": nmse}
-
-
-def _group_slices_into_volumes(
-    volume_names: list[str],
-    slice_indices: list[int],
-    predictions: list[np.ndarray],
-    targets: list[np.ndarray],
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    grouped: dict[str, list[tuple[int, np.ndarray, np.ndarray]]] = defaultdict(list)
-    for volume_name, slice_idx, prediction, target in zip(volume_names, slice_indices, predictions, targets):
-        grouped[str(volume_name)].append((int(slice_idx), prediction, target))
-    volumes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for volume_name, entries in grouped.items():
-        entries.sort(key=lambda item: item[0])
-        volumes[volume_name] = (
-            np.stack([entry[1] for entry in entries], axis=0),
-            np.stack([entry[2] for entry in entries], axis=0),
-        )
-    return volumes
-
-
-def _compute_volume_metrics(grouped: dict[str, tuple[np.ndarray, np.ndarray]]) -> dict[str, float]:
-    if not grouped:
-        return {"psnr": float("nan"), "ssim": float("nan"), "nmse": float("nan")}
-    metric_fns = _volume_metric_fns()
-    metric_lists: dict[str, list[float]] = {"psnr": [], "ssim": [], "nmse": []}
-    for prediction, target in grouped.values():
-        metric_lists["psnr"].append(float(metric_fns["psnr"](target, prediction)))
-        metric_lists["ssim"].append(float(metric_fns["ssim"](target, prediction)))
-        metric_lists["nmse"].append(float(metric_fns["nmse"](target, prediction)))
-    return {name: float(np.mean(values)) for name, values in metric_lists.items()}
-
-
 def _set_module_trainable(module: nn.Module, flag: bool) -> None:
     for parameter in module.parameters():
         parameter.requires_grad = bool(flag)
@@ -193,19 +84,24 @@ def _set_pre_post_trainable(model: SNRAwareMulticoilWrapper, flag: bool) -> None
 
 
 def build_dataloaders(config: ProjectConfig) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
-    """Create train/val/test dataloaders from typed config."""
-    train_dataset = MulticoilH5Dataset(
+    """Create 3D train/val/test dataloaders from typed config."""
+    train_dataset = MulticoilVolumeDataset(
         config.train_data,
         config.preprocess,
         split="train",
         subset=config.subset,
-        train_patch_size=config.train.train_patch_size,
+        patch_shape=config.train.patch,
     )
     val_loader = None
     if config.val_data.roots:
         val_loader = DataLoader(
-            MulticoilH5Dataset(config.val_data, config.preprocess, split="val"),
-            batch_size=max(1, min(8, int(config.train.batch_size))),
+            MulticoilVolumeDataset(
+                config.val_data,
+                config.preprocess,
+                split="val",
+                patch_shape=config.train.patch,
+            ),
+            batch_size=int(config.train.val_batch_size),
             shuffle=False,
             num_workers=int(config.train.num_workers),
             pin_memory=bool(config.train.pin_memory),
@@ -215,8 +111,13 @@ def build_dataloaders(config: ProjectConfig) -> tuple[DataLoader, DataLoader | N
     test_loader = None
     if config.test_data is not None and config.test_data.roots:
         test_loader = DataLoader(
-            MulticoilH5Dataset(config.test_data, config.preprocess, split="test"),
-            batch_size=max(1, min(8, int(config.train.batch_size))),
+            MulticoilVolumeDataset(
+                config.test_data,
+                config.preprocess,
+                split="test",
+                patch_shape=config.train.patch,
+            ),
+            batch_size=int(config.train.val_batch_size),
             shuffle=False,
             num_workers=int(config.train.num_workers),
             pin_memory=bool(config.train.pin_memory),
@@ -236,7 +137,7 @@ def build_dataloaders(config: ProjectConfig) -> tuple[DataLoader, DataLoader | N
 
 
 class MulticoilFineTuneTrainer:
-    """Small trainer for ones-gmap correction plus LoRA fine-tuning."""
+    """Trainer for 3D gmap correction plus LoRA fine-tuning."""
 
     def __init__(
         self,
@@ -261,6 +162,7 @@ class MulticoilFineTuneTrainer:
         self.current_epoch = 0
         self.best_val_psnr = float("-inf")
         self.best_epoch: int | None = None
+        self._printed_batch_contract = False
 
         if config.lora.enabled:
             self.lora_result = apply_lora_to_model(self.model.base_model, config.lora)
@@ -275,7 +177,7 @@ class MulticoilFineTuneTrainer:
 
     def _configure_initial_trainability(self) -> None:
         _set_module_trainable(self.model.base_model, False)
-        _set_module_trainable(self.model.correction_adapter, True)
+        _set_module_trainable(self.model.gmap_adapter, True)
         set_lora_trainable(self.model.base_model, False)
         _set_pre_post_trainable(self.model, False)
         self._apply_phase_trainability(0)
@@ -287,12 +189,12 @@ class MulticoilFineTuneTrainer:
         return params
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        correction_params = list(self.model.correction_adapter.parameters())
+        gmap_params = list(self.model.gmap_adapter.parameters())
         adapter_params = self._adapter_parameters()
         groups: list[dict[str, Any]] = [
             {
-                "name": "physics_correction",
-                "params": correction_params,
+                "name": "gmap_adapter",
+                "params": gmap_params,
                 "lr": float(self.config.train.correction_lr),
                 "weight_decay": float(self.config.train.weight_decay),
             }
@@ -318,17 +220,17 @@ class MulticoilFineTuneTrainer:
     def _apply_phase_trainability(self, epoch: int) -> None:
         phase = self._phase_name(epoch)
         if phase == "gmap_warmup":
-            _set_module_trainable(self.model.correction_adapter, False)
-            _set_module_trainable(self.model.correction_adapter.gmap_net, True)
-            self.model.correction_adapter.log_complex_scale.requires_grad = False
+            _set_module_trainable(self.model.gmap_adapter, False)
+            _set_module_trainable(self.model.gmap_adapter.gmap_unet, True)
+            self.model.gmap_adapter.log_complex_scale.requires_grad = False
             set_lora_trainable(self.model.base_model, False)
             _set_pre_post_trainable(self.model, False)
         elif phase == "correction_warmup":
-            _set_module_trainable(self.model.correction_adapter, True)
+            _set_module_trainable(self.model.gmap_adapter, True)
             set_lora_trainable(self.model.base_model, False)
             _set_pre_post_trainable(self.model, False)
         else:
-            _set_module_trainable(self.model.correction_adapter, True)
+            _set_module_trainable(self.model.gmap_adapter, True)
             set_lora_trainable(self.model.base_model, True)
             _set_pre_post_trainable(self.model, bool(self.config.train.train_pre_post))
 
@@ -340,8 +242,33 @@ class MulticoilFineTuneTrainer:
         enabled = bool(self.config.runtime.use_bf16 and self.device.type == "cuda")
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=enabled)
 
+    def _validate_train_batch(self, noisy: torch.Tensor, clean: torch.Tensor) -> None:
+        patch = self.config.train.patch
+        noisy_tail = (3, patch.depth, patch.height, patch.width)
+        clean_tail = (2, patch.depth, patch.height, patch.width)
+        if noisy.ndim != 5 or tuple(noisy.shape[1:]) != noisy_tail:
+            raise ValueError(f"Expected train noisy [B,3,D,H,W] with tail {noisy_tail}, got {tuple(noisy.shape)}")
+        if clean.ndim != 5 or tuple(clean.shape[1:]) != clean_tail:
+            raise ValueError(f"Expected train clean [B,2,D,H,W] with tail {clean_tail}, got {tuple(clean.shape)}")
+
+    def _validate_eval_batch(self, noisy: torch.Tensor, clean: torch.Tensor) -> None:
+        crop_h, crop_w = (int(v) for v in self.config.preprocess.crop_size)
+        if noisy.ndim != 5 or noisy.shape[0] != 1 or noisy.shape[1] != 3:
+            raise ValueError(f"Expected eval noisy [1,3,D,H,W], got {tuple(noisy.shape)}")
+        if clean.ndim != 5 or clean.shape[0] != 1 or clean.shape[1] != 2:
+            raise ValueError(f"Expected eval clean [1,2,D,H,W], got {tuple(clean.shape)}")
+        if noisy.shape[-2:] != (crop_h, crop_w) or clean.shape[-2:] != (crop_h, crop_w):
+            raise ValueError(
+                f"Eval H/W must be preprocess.crop_size {(crop_h, crop_w)}, "
+                f"got noisy={tuple(noisy.shape)} clean={tuple(clean.shape)}"
+            )
+        if noisy.shape[2] != clean.shape[2]:
+            raise ValueError(f"Eval noisy/clean D mismatch: noisy={tuple(noisy.shape)} clean={tuple(clean.shape)}")
+
     def _loss(self, pred: torch.Tensor, clean: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
-        scale = fastmri_current_magnitude_mean(noisy).to(device=pred.device, dtype=pred.dtype)
+        if pred.ndim != 5 or clean.ndim != 5 or noisy.ndim != 5:
+            raise ValueError("3D multicoil loss accepts only [B,C,D,H,W] tensors")
+        scale = current_magnitude_mean(noisy).to(device=pred.device, dtype=pred.dtype)
         complex_loss = self.loss_fn(pred / scale, clean / scale)
         magnitude_loss = self.loss_fn(complex_magnitude(pred) / scale, complex_magnitude(clean) / scale)
         return (
@@ -367,7 +294,7 @@ class MulticoilFineTuneTrainer:
             "psnr",
             "ssim",
             "nmse",
-            "lr_physics_correction",
+            "lr_gmap_adapter",
             "lr_adapter",
             "trainable_parameters",
             "complex_scale",
@@ -388,6 +315,16 @@ class MulticoilFineTuneTrainer:
                 return float(group["lr"])
         return None
 
+    def _print_batch_contract(self, noisy: torch.Tensor, clean: torch.Tensor, pred: torch.Tensor) -> None:
+        if self._printed_batch_contract:
+            return
+        print(
+            "first train batch tensor contract [B,C,D,H,W]: "
+            f"noisy={tuple(noisy.shape)} clean={tuple(clean.shape)} pred={tuple(pred.shape)}",
+            flush=True,
+        )
+        self._printed_batch_contract = True
+
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
         self._apply_phase_trainability(epoch)
@@ -398,12 +335,14 @@ class MulticoilFineTuneTrainer:
         for step, batch in enumerate(self.train_loader):
             if limit is not None and step >= int(limit):
                 break
-            noisy = batch["noisy"].to(self.device, non_blocking=True)
-            clean = batch["clean"].to(self.device, non_blocking=True)
+            noisy = batch["noisy"].to(self.device, non_blocking=True).float()
+            clean = batch["clean"].to(self.device, non_blocking=True).float()
+            self._validate_train_batch(noisy, clean)
             self.optimizer.zero_grad(set_to_none=True)
             with self._autocast():
                 pred = self.model(noisy, checkpoint_base_model=self._checkpoint_base_model_for_epoch(epoch))
                 loss = self._loss(pred.float(), clean.float(), noisy.float())
+            self._print_batch_contract(noisy, clean, pred)
             if not torch.isfinite(loss):
                 continue
             loss.backward()
@@ -416,7 +355,7 @@ class MulticoilFineTuneTrainer:
                     f"loss={np.mean(losses):.6f}",
                     flush=True,
                 )
-        stats = getattr(self.model.correction_adapter, "last_stats", None) or {}
+        stats = getattr(self.model.gmap_adapter, "last_stats", None) or {}
         result = {
             "loss": float(np.mean(losses)) if losses else float("nan"),
             "complex_scale": float(stats.get("complex_scale", float("nan"))),
@@ -429,7 +368,7 @@ class MulticoilFineTuneTrainer:
                 "stage": "train",
                 "epoch": epoch,
                 "phase": self._phase_name(epoch),
-                "lr_physics_correction": self._group_lr("physics_correction"),
+                "lr_gmap_adapter": self._group_lr("gmap_adapter"),
                 "lr_adapter": self._group_lr("adapter"),
                 "trainable_parameters": count_trainable_parameters(self.model),
                 **result,
@@ -437,87 +376,17 @@ class MulticoilFineTuneTrainer:
         )
         return result
 
-    def _eval_patch_positions(self, size: int, patch: int, overlap: int) -> list[int]:
-        if patch >= size:
-            return [0]
-        step = max(1, patch - overlap)
-        positions = list(range(0, size - patch + 1, step))
-        final = size - patch
-        if positions[-1] != final:
-            positions.append(final)
-        return positions
-
-    def _should_use_eval_patch_inference(self, noisy: torch.Tensor) -> bool:
-        patch_h, patch_w = (int(v) for v in self.config.train.train_patch_size)
-        return noisy.shape[-2] != patch_h or noisy.shape[-1] != patch_w
-
-    def _predict_direct_eval(self, noisy: torch.Tensor) -> torch.Tensor:
-        return self.model(noisy, checkpoint_base_model=False)
-
-    def _predict_sliding_window_eval(self, noisy: torch.Tensor) -> torch.Tensor:
-        batch_size, _channels, height, width = noisy.shape
-        patch_h, patch_w = (int(v) for v in self.config.train.train_patch_size)
-        overlap_h, overlap_w = int(self.config.train.overlap_for_inference[0]), int(
-            self.config.train.overlap_for_inference[1]
-        )
-        if patch_h > height or patch_w > width:
-            raise ValueError(f"Eval patch {(patch_h, patch_w)} must fit inside noisy image {(height, width)}")
-        tops = self._eval_patch_positions(height, patch_h, overlap_h)
-        lefts = self._eval_patch_positions(width, patch_w, overlap_w)
-        prediction_sum = torch.zeros(batch_size, 2, height, width, device=noisy.device, dtype=torch.float32)
-        weight_sum = torch.zeros(batch_size, 1, height, width, device=noisy.device, dtype=torch.float32)
-        pending: list[torch.Tensor] = []
-        coords: list[tuple[int, int]] = []
-        patch_budget = max(1, int(self.config.train.eval_patch_batch_size))
-
-        def flush() -> None:
-            if not pending:
-                return
-            chunk = torch.cat(pending, dim=0)
-            output = self._predict_direct_eval(chunk).float()
-            cursor = 0
-            for top, left in coords:
-                patch_output = output[cursor : cursor + batch_size]
-                cursor += batch_size
-                prediction_sum[..., top : top + patch_h, left : left + patch_w] += patch_output
-                weight_sum[..., top : top + patch_h, left : left + patch_w] += 1.0
-            pending.clear()
-            coords.clear()
-
-        for top in tops:
-            for left in lefts:
-                pending.append(noisy[..., top : top + patch_h, left : left + patch_w])
-                coords.append((top, left))
-                if len(pending) * batch_size >= patch_budget:
-                    flush()
-        flush()
-        return prediction_sum / weight_sum.clamp_min(1.0)
-
     def _predict_for_eval(self, noisy: torch.Tensor) -> torch.Tensor:
-        if self._should_use_eval_patch_inference(noisy):
-            return self._predict_sliding_window_eval(noisy)
-        return self._predict_direct_eval(noisy)
-
-    def _metadata_to_numpy(
-        self,
-        prediction: torch.Tensor,
-        clean: torch.Tensor,
-        metadata: list[dict[str, Any]],
-    ) -> tuple[list[str], list[int], list[np.ndarray], list[np.ndarray]]:
-        pred_mag = complex_magnitude(prediction).detach().cpu().float().numpy()
-        target_mag = complex_magnitude(clean).detach().cpu().float().numpy()
-        volume_names: list[str] = []
-        slice_indices: list[int] = []
-        predictions: list[np.ndarray] = []
-        targets: list[np.ndarray] = []
-        for index, entry in enumerate(metadata):
-            mean = float(entry.get("mean", 0.0))
-            std = float(entry.get("std", entry.get("scale", 1.0)))
-            volume_names.append(str(entry.get("volume_name", entry.get("name", "unknown_volume"))))
-            slice_indices.append(int(entry.get("slice_idx", index)))
-            predictions.append((pred_mag[index, 0] * std + mean).astype(np.float32, copy=False))
-            targets.append((target_mag[index, 0] * std + mean).astype(np.float32, copy=False))
-        return volume_names, slice_indices, predictions, targets
+        patch = self.config.train.patch
+        if tuple(noisy.shape[2:]) == patch.as_tensor_dhw():
+            return self.model(noisy, checkpoint_base_model=False)
+        return predict_sliding_window_3d(
+            self.model,
+            noisy,
+            patch=patch,
+            overlap=self.config.train.inference_overlap,
+            patch_batch_size=int(self.config.train.eval_patch_batch_size),
+        )
 
     @torch.no_grad()
     def evaluate(self, loader: DataLoader | None, *, stage: str, epoch: int | None) -> dict[str, float]:
@@ -525,31 +394,20 @@ class MulticoilFineTuneTrainer:
             return {}
         self.model.eval()
         losses: list[float] = []
-        volume_names: list[str] = []
-        slice_indices: list[int] = []
-        predictions: list[np.ndarray] = []
-        targets: list[np.ndarray] = []
+        volumes: list[tuple[str, np.ndarray, np.ndarray]] = []
         limit = self.config.train.limit_val_batches
         for step, batch in enumerate(loader):
             if limit is not None and step >= int(limit):
                 break
             noisy = batch["noisy"].to(self.device, non_blocking=True).float()
             clean = batch["clean"].to(self.device, non_blocking=True).float()
+            self._validate_eval_batch(noisy, clean)
             pred = self._predict_for_eval(noisy).float()
             losses.append(float(self._loss(pred, clean, noisy).cpu().item()))
-            batch_volume_names, batch_slice_indices, batch_predictions, batch_targets = self._metadata_to_numpy(
-                pred,
-                clean,
-                batch["metadata"],
-            )
-            volume_names.extend(batch_volume_names)
-            slice_indices.extend(batch_slice_indices)
-            predictions.extend(batch_predictions)
-            targets.extend(batch_targets)
-        grouped = _group_slices_into_volumes(volume_names, slice_indices, predictions, targets)
+            volumes.extend(restore_magnitude_volumes(pred, clean, batch["metadata"]))
         result = {
             "loss": float(np.mean(losses)) if losses else float("nan"),
-            **_compute_volume_metrics(grouped),
+            **compute_volume_metrics(volumes),
         }
         self._write_metrics_row(
             {
@@ -570,8 +428,11 @@ class MulticoilFineTuneTrainer:
         )
         if not lora_adapter:
             raise RuntimeError("No LoRA/pre-post adapter tensors were selected for checkpointing")
+        patch = self.config.train.patch
         payload = {
             "checkpoint_type": MULTICOIL_CHECKPOINT_TYPE,
+            "shape_contract": SHAPE_CONTRACT,
+            "patch": {"depth": patch.depth, "height": patch.height, "width": patch.width},
             "epoch": int(epoch),
             "metrics": metrics or {},
             "best_val_psnr": (
@@ -579,9 +440,9 @@ class MulticoilFineTuneTrainer:
             ),
             "best_epoch": None if self.best_epoch is None else int(self.best_epoch),
             "config": to_container(self.config),
-            "correction_adapter": {
+            "gmap_adapter": {
                 key: value.detach().cpu()
-                for key, value in self.model.correction_adapter.state_dict().items()
+                for key, value in self.model.gmap_adapter.state_dict().items()
             },
             "lora_adapter": lora_adapter,
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -598,8 +459,11 @@ class MulticoilFineTuneTrainer:
     def _load_checkpoint(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(checkpoint_path, map_location="cpu")
         if not _is_multicoil_checkpoint(payload):
-            raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
-        self.model.correction_adapter.load_state_dict(payload["correction_adapter"], strict=True)
+            raise ValueError(
+                "This is a 3D-only pipeline. 2D adapter checkpoints are not supported. "
+                f"Unsupported checkpoint: {checkpoint_path}"
+            )
+        self.model.gmap_adapter.load_state_dict(payload["gmap_adapter"], strict=True)
         lora_state = payload.get("lora_adapter", {})
         if not lora_state:
             raise RuntimeError(f"Checkpoint is missing LoRA/pre-post adapter tensors: {checkpoint_path}")
@@ -615,14 +479,14 @@ class MulticoilFineTuneTrainer:
         unexpected_adapter_keys = sorted(saved_keys - expected_keys)
         if missing_adapter_keys or unexpected_adapter_keys:
             raise RuntimeError(
-                "Adapter checkpoint keys do not match the current model/config: "
+                "Adapter checkpoint keys do not match the current 3D model/config: "
                 f"missing={missing_adapter_keys[:20]} unexpected={unexpected_adapter_keys[:20]}"
             )
         missing, unexpected = self.model.base_model.load_state_dict(lora_state, strict=False)
         missing_loaded_keys = sorted(set(missing) & expected_keys)
         if missing_loaded_keys or unexpected:
             raise RuntimeError(
-                "Failed to load multicoil adapter checkpoint: "
+                "Failed to load multicoil 3D adapter checkpoint: "
                 f"missing={missing_loaded_keys[:20]} unexpected={unexpected[:20]}"
             )
         if "optimizer_state_dict" in payload:
@@ -661,10 +525,11 @@ class MulticoilFineTuneTrainer:
             ),
             "last_checkpoint": None if save_best_only else str(last_ckpt_path),
             "save_best_only": save_best_only,
+            "shape_contract": SHAPE_CONTRACT,
             "lora_wrapped": None if self.lora_result is None else self.lora_result.wrapped_names,
         }
         for epoch in range(self.current_epoch, int(self.config.train.max_epochs)):
-            train_metrics = self.train_epoch(epoch)
+            self.train_epoch(epoch)
             val_metrics: dict[str, float] = {}
             if self.val_loader is not None and (epoch + 1) % int(self.config.train.evaluate_every_n_epochs) == 0:
                 val_metrics = self.evaluate(self.val_loader, stage="val", epoch=epoch)
@@ -688,9 +553,24 @@ class MulticoilFineTuneTrainer:
         return summary
 
 
+def _print_startup_contract(config: ProjectConfig) -> None:
+    patch = config.train.patch
+    overlap = config.train.inference_overlap
+    crop_h, crop_w = (int(v) for v in config.preprocess.crop_size)
+    print(
+        "tensor contract: [B,C,D,H,W]; "
+        f"train noisy=[B,3,{patch.depth},{patch.height},{patch.width}] "
+        f"clean=[B,2,{patch.depth},{patch.height},{patch.width}]; "
+        f"eval noisy=[1,3,D,{crop_h},{crop_w}]; "
+        f"patch D/H/W={patch.as_tensor_dhw()} overlap D/H/W={overlap.as_tensor_dhw()}",
+        flush=True,
+    )
+
+
 def run_training(config: ProjectConfig) -> dict[str, Any]:
-    """Build dataloaders/model and run fine-tuning."""
+    """Build dataloaders/model and run 3D fine-tuning."""
     seed_everything(int(config.runtime.seed))
+    _print_startup_contract(config)
     run_dir = Path(config.runtime.save_root) / str(config.runtime.run_name)
     train_loader, val_loader, test_loader = build_dataloaders(config)
     model, _model_config = build_multicoil_model(

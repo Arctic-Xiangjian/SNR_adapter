@@ -43,9 +43,9 @@ class GFactorUNet3D(nn.Module):
         if hidden <= 0:
             raise ValueError("hidden_chans must be positive")
         self.enc1 = ConvBlock3D(in_chans, hidden)
-        self.down1 = nn.Conv3d(hidden, hidden * 2, kernel_size=3, stride=2, padding=1)
+        self.down1 = nn.Conv3d(hidden, hidden * 2, kernel_size=3, stride=(1, 2, 2), padding=1)
         self.enc2 = ConvBlock3D(hidden * 2, hidden * 2)
-        self.down2 = nn.Conv3d(hidden * 2, hidden * 4, kernel_size=3, stride=2, padding=1)
+        self.down2 = nn.Conv3d(hidden * 2, hidden * 4, kernel_size=3, stride=(1, 2, 2), padding=1)
         self.bottleneck = ConvBlock3D(hidden * 4, hidden * 4)
         self.up2 = ConvBlock3D(hidden * 6, hidden * 2)
         self.up1 = ConvBlock3D(hidden * 3, hidden)

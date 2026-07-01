@@ -1,7 +1,7 @@
 import torch
 
 from snraware.projects.mri.multicoil.config import CorrectionConfig
-from snraware.projects.mri.multicoil.gmap_adapter import GFactorCorrectionAdapter3D
+from snraware.projects.mri.multicoil.gmap_adapter import GFactorCorrectionAdapter3D, GFactorUNet3D
 
 
 def test_gmap_adapter_zero_init_identity_and_gradients():
@@ -33,3 +33,21 @@ def test_gmap_adapter_rejects_non_5d_input():
         assert "[B, 3, D, H, W]" in str(exc)
     else:
         raise AssertionError("adapter accepted a non-5D input")
+
+
+def test_gmap_unet_downsampling_is_spatial_only():
+    unet = GFactorUNet3D(in_chans=3, hidden_chans=4)
+    assert unet.down1.stride == (1, 2, 2)
+    assert unet.down2.stride == (1, 2, 2)
+
+    x = torch.randn(1, 3, 5, 32, 32)
+    with torch.no_grad():
+        x1 = unet.enc1(x)
+        x2_down = unet.down1(x1)
+        x2 = unet.enc2(x2_down)
+        x3_down = unet.down2(x2)
+        out = unet(x)
+
+    assert tuple(x2_down.shape[-3:]) == (5, 16, 16)
+    assert tuple(x3_down.shape[-3:]) == (5, 8, 8)
+    assert tuple(out.shape) == (1, 1, 5, 32, 32)

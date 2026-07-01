@@ -3797,6 +3797,7 @@ dependencies = [
     { name = "torchinfo" },
     { name = "torchmetrics" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "typing-extensions" },
     { name = "wandb", extra = ["media"] },
 ]
@@ -3857,6 +3858,7 @@ requires-dist = [
     { name = "torchinfo" },
     { name = "torchmetrics", specifier = "==1.9.0" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "typing-extensions" },
     { name = "wandb" },
     { name = "wandb", extras = ["media"] },

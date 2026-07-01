@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .config import ProjectConfig, save_resolved_config, to_container
 from .lora import (
@@ -325,6 +326,13 @@ class MulticoilFineTuneTrainer:
         )
         self._printed_batch_contract = True
 
+    @staticmethod
+    def _progress_total(loader: DataLoader, limit: int | None) -> int:
+        total = len(loader)
+        if limit is not None:
+            total = min(total, int(limit))
+        return total
+
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
         self._apply_phase_trainability(epoch)
@@ -332,7 +340,16 @@ class MulticoilFineTuneTrainer:
             self.model.base_model.eval()
         losses: list[float] = []
         limit = self.config.train.limit_train_batches
-        for step, batch in enumerate(self.train_loader):
+        phase = self._phase_name(epoch)
+        progress = tqdm(
+            self.train_loader,
+            total=self._progress_total(self.train_loader, limit),
+            desc=f"train {epoch + 1}/{int(self.config.train.max_epochs)} {phase}",
+            dynamic_ncols=True,
+            leave=True,
+            mininterval=1.0,
+        )
+        for step, batch in enumerate(progress):
             if limit is not None and step >= int(limit):
                 break
             noisy = batch["noisy"].to(self.device, non_blocking=True).float()
@@ -344,16 +361,18 @@ class MulticoilFineTuneTrainer:
                 loss = self._loss(pred.float(), clean.float(), noisy.float())
             self._print_batch_contract(noisy, clean, pred)
             if not torch.isfinite(loss):
+                progress.set_postfix(phase=phase, loss="nan", refresh=False)
                 continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.config.train.gradient_clip_val))
             self.optimizer.step()
             losses.append(float(loss.detach().cpu().item()))
+            mean_loss = float(np.mean(losses))
+            progress.set_postfix(phase=phase, loss=f"{mean_loss:.6f}", refresh=False)
             if (step + 1) % int(self.config.train.log_every_n_steps) == 0:
-                print(
+                progress.write(
                     f"epoch={epoch} step={step + 1} phase={self._phase_name(epoch)} "
-                    f"loss={np.mean(losses):.6f}",
-                    flush=True,
+                    f"loss={mean_loss:.6f}"
                 )
         stats = getattr(self.model.gmap_adapter, "last_stats", None) or {}
         result = {
@@ -396,7 +415,16 @@ class MulticoilFineTuneTrainer:
         losses: list[float] = []
         volumes: list[tuple[str, np.ndarray, np.ndarray]] = []
         limit = self.config.train.limit_val_batches
-        for step, batch in enumerate(loader):
+        epoch_label = "-" if epoch is None else str(epoch + 1)
+        progress = tqdm(
+            loader,
+            total=self._progress_total(loader, limit),
+            desc=f"{stage} {epoch_label}",
+            dynamic_ncols=True,
+            leave=True,
+            mininterval=1.0,
+        )
+        for step, batch in enumerate(progress):
             if limit is not None and step >= int(limit):
                 break
             noisy = batch["noisy"].to(self.device, non_blocking=True).float()
@@ -404,6 +432,7 @@ class MulticoilFineTuneTrainer:
             self._validate_eval_batch(noisy, clean)
             pred = self._predict_for_eval(noisy).float()
             losses.append(float(self._loss(pred, clean, noisy).cpu().item()))
+            progress.set_postfix(loss=f"{float(np.mean(losses)):.6f}", refresh=False)
             volumes.extend(restore_magnitude_volumes(pred, clean, batch["metadata"]))
         result = {
             "loss": float(np.mean(losses)) if losses else float("nan"),

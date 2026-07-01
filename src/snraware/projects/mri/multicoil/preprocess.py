@@ -91,8 +91,8 @@ def build_random_1d_mask(
 ) -> np.ndarray:
     """Build deterministic random Cartesian mask with an ACS center."""
     width = int(width)
-    nsamp_target = max(1, int(round(width / int(acc_factor))))
-    nsamp_center = min(max(1, int(round(width * float(center_fraction)))), width)
+    nsamp_target = max(1, round(width / int(acc_factor)))
+    nsamp_center = min(max(1, round(width * float(center_fraction))), width)
     nsamp_target = max(nsamp_target, nsamp_center)
 
     mask = np.zeros(width, dtype=bool)
@@ -118,8 +118,8 @@ def build_uniform_1d_mask(
 ) -> np.ndarray:
     """Build deterministic equispaced Cartesian mask with an ACS center."""
     width = int(width)
-    nsamp_target = max(1, int(round(width / int(acc_factor))))
-    nsamp_center = min(max(1, int(round(width * float(center_fraction)))), width)
+    nsamp_target = max(1, round(width / int(acc_factor)))
+    nsamp_center = min(max(1, round(width * float(center_fraction))), width)
     nsamp_target = max(nsamp_target, nsamp_center)
 
     mask = np.zeros(width, dtype=bool)
@@ -164,8 +164,8 @@ def build_1d_mask(
 
 def _corner_noise_samples(kspace: np.ndarray, corner_fraction: float) -> np.ndarray:
     coils, height, width = kspace.shape
-    corner_h = min(max(4, int(round(height * float(corner_fraction)))), max(1, height // 2))
-    corner_w = min(max(4, int(round(width * float(corner_fraction)))), max(1, width // 2))
+    corner_h = min(max(4, round(height * float(corner_fraction))), max(1, height // 2))
+    corner_w = min(max(4, round(width * float(corner_fraction))), max(1, width // 2))
     corners = [
         kspace[:, :corner_h, :corner_w],
         kspace[:, :corner_h, -corner_w:],
@@ -239,7 +239,7 @@ def estimate_scc_matrix(kspace: np.ndarray, *, ncc: int, center_fraction: float)
     kspace = check_complex_coil_kspace(kspace, name="kspace")
     coils, _height, width = kspace.shape
     ncc = min(max(1, int(ncc)), coils)
-    acs_width = max(1, int(round(width * float(center_fraction))))
+    acs_width = max(1, round(width * float(center_fraction)))
     start = width // 2 - acs_width // 2
     calib = kspace[:, :, start : start + acs_width]
     samples = np.moveaxis(calib, 0, -1).reshape(-1, coils)
@@ -254,7 +254,7 @@ def extract_center_calib(kspace: np.ndarray, center_fraction: float) -> np.ndarr
     """Extract the centered ACS region for GRAPPA and CSM estimation."""
     kspace = check_complex_coil_kspace(kspace, name="kspace")
     width = int(kspace.shape[-1])
-    acs_width = max(1, int(round(width * float(center_fraction))))
+    acs_width = max(1, round(width * float(center_fraction)))
     start = width // 2 - acs_width // 2
     return kspace[:, :, start : start + acs_width].copy()
 
@@ -262,8 +262,8 @@ def extract_center_calib(kspace: np.ndarray, center_fraction: float) -> np.ndarr
 def hamming_windowed_calib(kspace: np.ndarray, center_fraction: float) -> np.ndarray:
     """Put a Hamming-windowed ACS block onto the full k-space grid."""
     kspace = check_complex_coil_kspace(kspace, name="kspace")
-    coils, _height, width = kspace.shape
-    calib_width = max(1, int(round(width * float(center_fraction))))
+    _coils, _height, width = kspace.shape
+    calib_width = max(1, round(width * float(center_fraction)))
     start = width // 2 - calib_width // 2
     calib = np.zeros_like(kspace, dtype=np.complex64)
     window = np.hamming(calib_width).astype(np.float32)

@@ -1,4 +1,4 @@
-"""Volume-stacking dataset for 3D-only multicoil SNRAware training."""
+"""Volume-stacking dataset for 2D/3D multicoil SNRAware training."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def _tensorize_slice_result(result: MulticoilPreprocessResult) -> tuple[torch.Te
 
 
 class MulticoilVolumeDataset(Dataset):
-    """Emit 3D training windows or full validation/test volumes."""
+    """Emit train windows or full validation/test volumes."""
 
     def __init__(
         self,
@@ -191,7 +191,7 @@ class MulticoilVolumeDataset(Dataset):
         if subset.mode == "none":
             return volumes
         if subset.mode == "random_slice":
-            raise ValueError("The 3D multicoil pipeline does not support random_slice subsets")
+            raise ValueError("The multicoil pipeline does not support random_slice subsets")
         rng = random.Random(int(subset.seed))
         shuffled = list(volumes)
         rng.shuffle(shuffled)

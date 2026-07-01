@@ -1,4 +1,4 @@
-"""Explicit 3D multicoil fine-tuning loop."""
+"""Explicit 2D/3D multicoil fine-tuning loop."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from .config import ProjectConfig, save_resolved_config, to_container
+from .config import PatchShape3D, ProjectConfig, save_resolved_config, to_container
 from .lora import (
     apply_lora_to_model,
     count_trainable_parameters,
@@ -56,6 +56,24 @@ def _is_multicoil_checkpoint(payload: Any) -> bool:
     return isinstance(payload, dict) and payload.get("checkpoint_type") == MULTICOIL_CHECKPOINT_TYPE
 
 
+def _validate_checkpoint_patch(
+    payload: dict[str, Any],
+    current_patch: PatchShape3D,
+    checkpoint_path: str | Path,
+) -> None:
+    saved_patch = payload.get("patch")
+    if not isinstance(saved_patch, dict):
+        raise RuntimeError(f"Checkpoint is missing patch metadata: {checkpoint_path}")
+    saved = tuple(int(saved_patch.get(key, -1)) for key in ("depth", "height", "width"))
+    current = current_patch.as_tensor_dhw()
+    if saved != current:
+        raise RuntimeError(
+            "Checkpoint patch shape does not match the current config: "
+            f"checkpoint D/H/W={saved} current D/H/W={current}. "
+            "Resume requires the same 2D/3D patch shape."
+        )
+
+
 def seed_everything(seed: int) -> None:
     """Seed Python, NumPy, and PyTorch RNGs."""
     random.seed(seed)
@@ -85,7 +103,7 @@ def _set_pre_post_trainable(model: SNRAwareMulticoilWrapper, flag: bool) -> None
 
 
 def build_dataloaders(config: ProjectConfig) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
-    """Create 3D train/val/test dataloaders from typed config."""
+    """Create 2D/3D train/val/test dataloaders from typed config."""
     train_dataset = MulticoilVolumeDataset(
         config.train_data,
         config.preprocess,
@@ -138,7 +156,7 @@ def build_dataloaders(config: ProjectConfig) -> tuple[DataLoader, DataLoader | N
 
 
 class MulticoilFineTuneTrainer:
-    """Trainer for 3D gmap correction plus LoRA fine-tuning."""
+    """Trainer for multicoil gmap correction plus LoRA fine-tuning."""
 
     def __init__(
         self,
@@ -268,14 +286,18 @@ class MulticoilFineTuneTrainer:
 
     def _loss(self, pred: torch.Tensor, clean: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
         if pred.ndim != 5 or clean.ndim != 5 or noisy.ndim != 5:
-            raise ValueError("3D multicoil loss accepts only [B,C,D,H,W] tensors")
+            raise ValueError("multicoil loss accepts only [B,C,D,H,W] tensors")
         scale = current_magnitude_max(noisy).to(device=pred.device, dtype=pred.dtype)
-        complex_loss = self.loss_fn(pred / scale, clean / scale)
-        magnitude_loss = self.loss_fn(complex_magnitude(pred) / scale, complex_magnitude(clean) / scale)
-        return (
-            float(self.config.train.complex_loss_weight) * complex_loss
-            + float(self.config.train.magnitude_loss_weight) * magnitude_loss
-        )
+        loss = pred.new_zeros(())
+        complex_weight = float(self.config.train.complex_loss_weight)
+        magnitude_weight = float(self.config.train.magnitude_loss_weight)
+        if complex_weight != 0.0:
+            complex_loss = self.loss_fn(pred / scale, clean / scale)
+            loss = loss + complex_weight * complex_loss
+        if magnitude_weight != 0.0:
+            magnitude_loss = self.loss_fn(complex_magnitude(pred) / scale, complex_magnitude(clean) / scale)
+            loss = loss + magnitude_weight * magnitude_loss
+        return loss
 
     def _checkpoint_base_model_for_epoch(self, epoch: int) -> bool:
         return bool(self.config.train.gradient_checkpoint_frozen_base and self.model.training)
@@ -489,9 +511,10 @@ class MulticoilFineTuneTrainer:
         payload = torch.load(checkpoint_path, map_location="cpu")
         if not _is_multicoil_checkpoint(payload):
             raise ValueError(
-                "This is a 3D-only pipeline. 2D adapter checkpoints are not supported. "
+                "This is a 2D/3D multicoil pipeline and requires a multicoil adapter checkpoint. "
                 f"Unsupported checkpoint: {checkpoint_path}"
             )
+        _validate_checkpoint_patch(payload, self.config.train.patch, checkpoint_path)
         self.model.gmap_adapter.load_state_dict(payload["gmap_adapter"], strict=True)
         lora_state = payload.get("lora_adapter", {})
         if not lora_state:
@@ -508,14 +531,14 @@ class MulticoilFineTuneTrainer:
         unexpected_adapter_keys = sorted(saved_keys - expected_keys)
         if missing_adapter_keys or unexpected_adapter_keys:
             raise RuntimeError(
-                "Adapter checkpoint keys do not match the current 3D model/config: "
+                "Adapter checkpoint keys do not match the current multicoil model/config: "
                 f"missing={missing_adapter_keys[:20]} unexpected={unexpected_adapter_keys[:20]}"
             )
         missing, unexpected = self.model.base_model.load_state_dict(lora_state, strict=False)
         missing_loaded_keys = sorted(set(missing) & expected_keys)
         if missing_loaded_keys or unexpected:
             raise RuntimeError(
-                "Failed to load multicoil 3D adapter checkpoint: "
+                "Failed to load multicoil adapter checkpoint: "
                 f"missing={missing_loaded_keys[:20]} unexpected={unexpected[:20]}"
             )
         if "optimizer_state_dict" in payload:

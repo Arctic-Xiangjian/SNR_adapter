@@ -56,6 +56,34 @@ def test_train_dataset_returns_contiguous_3d_window(monkeypatch, tmp_path):
     assert 0 <= sample["metadata"]["patch_left"] <= 320
 
 
+def test_train_dataset_returns_single_slice_2d_window(monkeypatch, tmp_path):
+    h5_path = tmp_path / "volume_2d.h5"
+    _make_h5(h5_path)
+
+    def fake_load(self, ref):
+        return _fake_result(ref.slice_idx)
+
+    monkeypatch.setattr(MulticoilVolumeDataset, "_load_or_preprocess", fake_load)
+    dataset = MulticoilVolumeDataset(
+        H5DataConfig(roots=[str(h5_path)]),
+        PreprocessConfig(cache_dir=None),
+        split="train",
+        patch_shape=PatchShape3D(depth=1, height=64, width=64),
+    )
+    sample = dataset[0]
+    batch = collate_multicoil_batch([sample, sample])
+
+    assert tuple(sample["noisy"].shape) == (3, 1, 64, 64)
+    assert tuple(sample["clean"].shape) == (2, 1, 64, 64)
+    assert tuple(batch["noisy"].shape) == (2, 3, 1, 64, 64)
+    assert tuple(batch["clean"].shape) == (2, 2, 1, 64, 64)
+    assert len(sample["metadata"]["z_indices"]) == 1
+    assert len(sample["metadata"]["slice_scales"]) == 1
+    assert sample["metadata"]["volume_name"] == "volume_2d"
+    assert 0 <= sample["metadata"]["patch_top"] <= 320
+    assert 0 <= sample["metadata"]["patch_left"] <= 320
+
+
 def test_val_dataset_returns_full_volume(monkeypatch, tmp_path):
     h5_path = tmp_path / "volume_b.h5"
     _make_h5(h5_path)

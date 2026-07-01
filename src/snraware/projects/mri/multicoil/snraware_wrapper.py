@@ -1,4 +1,4 @@
-"""SNRAware model wrapper for native 3D multicoil inputs."""
+"""SNRAware model wrapper for native 2D/3D multicoil inputs."""
 
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ def build_base_model(
 
 
 class SNRAwareMulticoilWrapper(nn.Module):
-    """Frozen SNRAware base plus 3D gmap correction adapter."""
+    """Frozen SNRAware base plus gmap correction adapter."""
 
     def __init__(
         self,
@@ -189,7 +189,7 @@ def build_multicoil_model(
     preprocess_config: PreprocessConfig,
     train_config: TrainConfig,
 ) -> tuple[SNRAwareMulticoilWrapper, DictConfig]:
-    """Build the wrapped 3D multicoil model."""
+    """Build the wrapped multicoil model."""
     base_model, model_config = build_base_model(base_config, preprocess_config, train_config)
     return (
         SNRAwareMulticoilWrapper(

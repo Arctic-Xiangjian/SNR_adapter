@@ -16,22 +16,31 @@ whitened/compressed coil basis. The gmap channel is always ones in preprocessing
 `PhysicsCorrectionAdapter` learns bounded complex-scale and effective-gmap
 corrections during fine-tuning.
 
-## SOTA-Parity Invariants
+## Depth Defaults
 
-The current fastMRI 5% random-volume run is intentionally aligned to the
-working SOTA run in `/working2/arctic/snrawre/SNRAware`:
+The multicoil path is 2D-first while keeping the unified tensor contract
+`[B,C,D,H,W]`:
 
-- SNRAware base model is built at `train.train_patch_size: [64, 64]`.
+- Default training and validation patch depth is `train.patch.depth: 1`.
+- Explicit 3D is supported only with `train.patch.depth: 16`.
+- Other patch depths are rejected at config load time.
+- Full validation images still use sliding-window inference over the `384x384`
+  preprocess crop and aggregate full-volume PSNR/SSIM/NMSE.
+
+The current fastMRI 5% random-volume config keeps these invariants:
+
+- SNRAware base model is built at `train.patch: {depth: 1, height: 64, width: 64}`
+  by default.
 - Full validation images use sliding-window inference over the `384x384`
-  preprocess crop with `train.overlap_for_inference: [16, 16, 0]`.
+  preprocess crop with `train.inference_overlap: {depth: 0, height: 16, width: 16}`.
 - Base checkpoint loading must report `matched_keys=1128`,
   `mismatched_keys=0`, and `total_model_keys=1128`.
 - The public path keeps `preprocess.mc_gmap: 0` and
   `preprocess.gmap_mode: ones`; learned correction happens after the all-ones
   channel is assembled.
 
-Do not change `train.train_patch_size` to the full crop size unless the base
-checkpoint inheritance strategy is intentionally being changed.
+Do not change `train.patch.height` or `train.patch.width` to the full crop size
+unless the base checkpoint inheritance strategy is intentionally being changed.
 
 ## Base Model Checkpoints
 
@@ -76,6 +85,17 @@ python train_multicoil.py \
   --config configs/multicoil/fastmri_x8_cf004_partial05_gmap_ones.yaml
 ```
 
+Start the explicit 3D-16 path:
+
+```bash
+cd /working2/arctic/project2/SNRAware
+python train_multicoil.py \
+  --config configs/multicoil/fastmri_x8_cf004_partial05_gmap_ones.yaml \
+  --set train.patch.depth=16 \
+  --set train.inference_overlap.depth=8 \
+  --set runtime.run_name=fastmri_x8_cf004_partial05_3d_d16_gmap_ones
+```
+
 Switch the inherited SNRAware backbone to the local small checkpoint:
 
 ```bash
@@ -94,6 +114,8 @@ python train_multicoil.py \
 - `preprocess.cache_dir`: transparent cache for preprocessed arrays and metadata.
 - `correction`: bounds for learned complex scale and effective gmap correction.
 - `lora`: regex-selected LoRA modules inside the frozen SNRAware base model.
+- `train.patch.depth`: defaults to `1` for 2D; set to `16` explicitly for the
+  only supported 3D path.
 - `subset`: optional training subset, with current public config using 5% random
   volume sampling.
 - `base_model.variant`: `large` or `small`; paths are resolved from the local

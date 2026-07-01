@@ -1,4 +1,4 @@
-"""5D loss helpers and volume metrics for 3D multicoil fine-tuning."""
+"""5D loss helpers and volume metrics for multicoil fine-tuning."""
 
 from __future__ import annotations
 

@@ -187,9 +187,12 @@ class CorrectionConfig:
 
 @dataclass(frozen=True)
 class PatchShape3D:
-    """SNRAware 3D patch shape in tensor order D/H/W."""
+    """SNRAware patch shape in tensor order D/H/W.
 
-    depth: int = 16
+    D=1 is the default 2D path. D=16 is the only supported explicit 3D path.
+    """
+
+    depth: int = 1
     height: int = 64
     width: int = 64
 
@@ -217,9 +220,9 @@ class PatchShape3D:
 
 @dataclass(frozen=True)
 class OverlapShape3D:
-    """3D sliding-window overlap in tensor order D/H/W."""
+    """Sliding-window overlap in tensor order D/H/W."""
 
-    depth: int = 8
+    depth: int = 0
     height: int = 16
     width: int = 16
 
@@ -313,12 +316,16 @@ class TrainConfig:
         self.inference_overlap = OverlapShape3D.from_value(self.inference_overlap)
         if self.mode != "warmup_then_both":
             raise ValueError("This clean project keeps only mode='warmup_then_both'")
+        if self.patch.depth not in {1, 16}:
+            raise ValueError("train.patch.depth supports only 1 for 2D or 16 for explicit 3D")
+        if self.patch.depth == 1 and self.inference_overlap.depth != 0:
+            raise ValueError("train.inference_overlap.depth must be 0 when train.patch.depth=1")
         if self.gmap_warmup_epochs > self.warmup_epochs:
             raise ValueError("train.gmap_warmup_epochs must be <= train.warmup_epochs")
         if int(self.batch_size) <= 0:
             raise ValueError("train.batch_size must be positive")
         if int(self.val_batch_size) != 1:
-            raise ValueError("3D validation/test dataloaders require train.val_batch_size=1")
+            raise ValueError("multicoil validation/test dataloaders require train.val_batch_size=1")
         if self.eval_patch_batch_size <= 0:
             raise ValueError("train.eval_patch_batch_size must be positive")
         if (
@@ -337,7 +344,7 @@ class RuntimeConfig:
     use_bf16: bool = True
     seed: int = 3875032963
     save_root: str = "/working2/arctic/project2/runs"
-    run_name: str = "fastmri_x8_cf004_partial05_3d_d16_gmap_ones"
+    run_name: str = "fastmri_x8_cf004_partial05_2d_d1_gmap_ones"
 
 
 @dataclass

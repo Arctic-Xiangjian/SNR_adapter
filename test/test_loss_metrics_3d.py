@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn as nn
 
 from snraware.projects.mri.multicoil.metrics import (
     complex_magnitude,
@@ -7,6 +8,7 @@ from snraware.projects.mri.multicoil.metrics import (
     current_magnitude_max,
     restore_magnitude_volumes,
 )
+from snraware.projects.mri.multicoil.trainer import MulticoilFineTuneTrainer
 
 
 def test_5d_magnitude_and_current_max_scale_shapes():
@@ -52,3 +54,33 @@ def test_volume_metrics_accept_restored_volume_arrays():
 
     assert metrics["nmse"] == 0.0
     assert np.isfinite(metrics["psnr"]) or np.isinf(metrics["psnr"])
+
+
+def test_zero_magnitude_loss_weight_skips_sqrt_backward_branch():
+    trainer = MulticoilFineTuneTrainer.__new__(MulticoilFineTuneTrainer)
+    trainer.loss_fn = nn.L1Loss()
+    trainer.config = type(
+        "Config",
+        (),
+        {
+            "train": type(
+                "Train",
+                (),
+                {
+                    "complex_loss_weight": 1.0,
+                    "magnitude_loss_weight": 0.0,
+                },
+            )()
+        },
+    )()
+
+    pred = torch.zeros(1, 2, 1, 2, 2, requires_grad=True)
+    clean = torch.zeros_like(pred)
+    noisy = torch.zeros(1, 3, 1, 2, 2)
+
+    loss = trainer._loss(pred, clean, noisy)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
